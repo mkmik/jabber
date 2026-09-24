@@ -106,7 +106,7 @@ enum AppMode {
             attribution: "Apple Speech Framework (macOS 26+)",
             isBuiltIn: true
         )
-    ]
+    ].filter { $0.family != .appleSpeech || AppleSpeechProvider.isSupported }
 
     static func modelDefinition(for modelId: String) -> ModelDefinition? {
         modelDefinitions.first { $0.id == modelId }

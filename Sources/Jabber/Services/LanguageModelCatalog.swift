@@ -14,7 +14,17 @@ enum LanguageModelCatalog {
         "en", "es", "fr", "de", "pt", "it", "ja", "ko", "zh", "hi", "ar"
     ]
 
+    /// Drops routes to models this Mac can't run (Apple Speech before macOS
+    /// 26) and promotes the next one so the language keeps a recommendation.
     static func routes(for languageCode: String) -> [Route] {
+        var routes = allRoutes(for: languageCode).filter { AppMode.modelDefinition(for: $0.modelId) != nil }
+        if !routes.contains(where: \.isRecommended), let first = routes.first {
+            routes[0] = .init(modelId: first.modelId, isRecommended: true)
+        }
+        return routes
+    }
+
+    private static func allRoutes(for languageCode: String) -> [Route] {
         if languageCode == "auto" {
             // Apple Speech leads because it covers every language Jabber
             // offers; Parakeet v3 needs the language named to pick a script.

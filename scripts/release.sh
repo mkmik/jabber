@@ -242,7 +242,7 @@ compile_assets() {
     if ! xcrun actool "${assets_path}" \
       --compile "${resources_dir}" \
       --platform macosx \
-      --minimum-deployment-target 26.0 \
+      --minimum-deployment-target 15.0 \
       --app-icon AppIcon \
       --output-partial-info-plist "${BUILD_DIR}/AssetInfo.plist"; then
       echo "Error: failed to compile assets at ${assets_path}" >&2
@@ -254,25 +254,31 @@ compile_assets() {
 sign_app() {
   local app_bundle="${BUILD_DIR}/${APP_NAME}.app"
   local entitlements="${PROJECT_ROOT}/Jabber.entitlements"
+  # Ad-hoc signatures (SIGNING_IDENTITY=-) carry no Team ID, so the hardened
+  # runtime's library validation would refuse to load Sparkle.framework.
+  local sign_flags=(--force --options runtime)
+  if [[ "${SIGNING_IDENTITY}" == "-" ]]; then
+    sign_flags=(--force)
+  fi
   
   # Sign Sparkle.framework first
-  codesign --force --options runtime --deep \
+  codesign "${sign_flags[@]}" --deep \
     --sign "${SIGNING_IDENTITY}" \
     "${app_bundle}/Contents/Frameworks/Sparkle.framework"
 
   # Sign MediaRemoteAdapter before signing the executable/app bundle.
-  codesign --force --options runtime \
+  codesign "${sign_flags[@]}" \
     --sign "${SIGNING_IDENTITY}" \
     "${app_bundle}/Contents/Frameworks/libMediaRemoteAdapter.dylib"
 
   # Sign the main executable
-  codesign --force --options runtime \
+  codesign "${sign_flags[@]}" \
     --entitlements "${entitlements}" \
     --sign "${SIGNING_IDENTITY}" \
     "${app_bundle}/Contents/MacOS/${APP_NAME}"
   
   # Sign the app bundle
-  codesign --force --options runtime \
+  codesign "${sign_flags[@]}" \
     --entitlements "${entitlements}" \
     --sign "${SIGNING_IDENTITY}" \
     "${app_bundle}"

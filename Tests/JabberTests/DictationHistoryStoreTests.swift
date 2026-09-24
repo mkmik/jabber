@@ -343,6 +343,7 @@ final class DictationHistoryStoreTests: XCTestCase {
     // MARK: - Bug 3: corrupt metadata.json must be pruned, not just missing
 
     func testSaveRecordsHumanReadableModelNameForEveryModel() async throws {
+        try XCTSkipUnless(AppleSpeechProvider.isSupported, "Apple Speech needs macOS 26")
         // The history entry's `modelName` label must show the human-readable
         // display name for every model family instead of leaking raw ids into
         // the UI.

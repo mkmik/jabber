@@ -14,7 +14,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 readonly SCRIPT_DIR PROJECT_ROOT
 readonly APP_NAME="JabberIconPreview"
-readonly DEPLOYMENT_TARGET="26.0"
+readonly DEPLOYMENT_TARGET="15.0"
 readonly PREVIEW_DIR="${TMPDIR:-/tmp}/jabber-icon-preview"
 
 main() {

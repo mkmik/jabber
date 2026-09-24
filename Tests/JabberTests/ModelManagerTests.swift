@@ -47,7 +47,8 @@ final class ModelManagerTests: XCTestCase {
         try await super.tearDown()
     }
 
-    func testModelDefinitionsExist() {
+    func testModelDefinitionsExist() throws {
+        try XCTSkipUnless(AppleSpeechProvider.isSupported, "Apple Speech needs macOS 26")
         XCTAssertFalse(modelManager.models.isEmpty, "Should have model definitions")
 
         let modelIds = modelManager.models.map { $0.id }
@@ -197,7 +198,8 @@ final class ModelManagerTests: XCTestCase {
         XCTAssertEqual(parakeetModel.sizeHint, "~443MB")
     }
 
-    func testBuiltInModelAlwaysDownloaded() {
+    func testBuiltInModelAlwaysDownloaded() throws {
+        try XCTSkipUnless(AppleSpeechProvider.isSupported, "Apple Speech needs macOS 26")
         guard let appleModel = modelManager.models.first(where: { $0.id == "apple-speech" }) else {
             XCTFail("Apple Speech model not found")
             return
@@ -378,7 +380,8 @@ final class ModelManagerTests: XCTestCase {
         XCTAssertFalse(modelManager.isSelectedModelDownloaded)
     }
 
-    func testIsSelectedModelDownloadedIsTrueForBuiltInSelection() {
+    func testIsSelectedModelDownloadedIsTrueForBuiltInSelection() throws {
+        try XCTSkipUnless(AppleSpeechProvider.isSupported, "Apple Speech needs macOS 26")
         settings[.selectedModel] = AppMode.appleSpeechModelId
         modelManager.refreshModels()
         XCTAssertTrue(modelManager.isSelectedModelDownloaded)

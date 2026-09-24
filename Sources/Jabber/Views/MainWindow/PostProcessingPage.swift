@@ -21,7 +21,7 @@ struct PostProcessingPage: View {
 
                     switch selectedPostProcessingProviderKind {
                     case .appleIntelligence:
-                        Text("Uses the on-device Apple Intelligence model to clean up the final transcript — fixing punctuation, removing filler words and self-corrections — before typing it. Requires an Apple Intelligence-capable Mac with Apple Intelligence turned on. Falls back to the raw transcript if unavailable.")
+                        Text("Uses the on-device Apple Intelligence model to clean up the final transcript — fixing punctuation, removing filler words and self-corrections — before typing it. Requires macOS 26 on an Apple Intelligence-capable Mac with Apple Intelligence turned on. Falls back to the raw transcript if unavailable.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     case .openRouter:

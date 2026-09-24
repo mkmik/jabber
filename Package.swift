@@ -1,11 +1,11 @@
-// swift-tools-version: 6.1
+// swift-tools-version: 6.0
 
 import PackageDescription
 
 let package = Package(
     name: "Jabber",
     platforms: [
-        .macOS("26.0")
+        .macOS(.v15)
     ],
     products: [
         .executable(name: "Jabber", targets: ["Jabber"])
@@ -39,7 +39,9 @@ let package = Package(
         .testTarget(
             name: "JabberTests",
             dependencies: ["Jabber"],
-            path: "Tests/JabberTests"
+            path: "Tests/JabberTests",
+            // Swift 6.0 rejects `await super.setUp()` in @MainActor test cases.
+            swiftSettings: [.swiftLanguageMode(.v5)]
         )
     ]
 )
