@@ -13,7 +13,7 @@ All audio is processed entirely on-device — nothing leaves your Mac. (Optional
 
 ## Requirements
 
-- macOS 26.0+ (Tahoe)
+- macOS 15.0+ (Sequoia); Apple Speech and Apple Intelligence refinement need macOS 26 (Tahoe)
 - Apple Silicon required
 
 ## Installation
@@ -30,6 +30,7 @@ For a release build with signing:
 
 ```bash
 ./scripts/release.sh --skip-notarize  # local testing
+SIGNING_IDENTITY=- ./scripts/release.sh --skip-notarize  # local testing without a Developer ID
 ./scripts/release.sh                   # full signed + notarized DMG
 ```
 

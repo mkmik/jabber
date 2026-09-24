@@ -335,7 +335,8 @@ final class TranscriptionServiceTests: XCTestCase {
         XCTAssertEqual(TranscriptionService.resolveLanguage("auto"), "auto")
     }
 
-    func testResolveLanguageAcceptsValidCode() {
+    func testResolveLanguageAcceptsValidCode() throws {
+        try XCTSkipUnless(AppleSpeechProvider.isSupported, "Apple Speech needs macOS 26")
         XCTAssertEqual(TranscriptionService.resolveLanguage("en"), "en")
         XCTAssertEqual(TranscriptionService.resolveLanguage("zh"), "zh")
         XCTAssertEqual(TranscriptionService.resolveLanguage("fa"), "fa")

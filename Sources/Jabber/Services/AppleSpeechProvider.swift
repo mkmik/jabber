@@ -5,6 +5,17 @@ import os
 import Speech
 
 final class AppleSpeechProvider: TranscriptionProvider, @unchecked Sendable {
+    /// SpeechAnalyzer needs macOS 26 at runtime and the macOS 26 SDK (Swift
+    /// 6.2) at build time; without both, Jabber hides this model.
+    static var isSupported: Bool {
+        #if compiler(>=6.2)
+        if #available(macOS 26, *) {
+            return true
+        }
+        #endif
+        return false
+    }
+
     let modelId: String
 
     private let logger = Logger(subsystem: "com.rselbach.jabber", category: "AppleSpeechProvider")
@@ -25,18 +36,25 @@ final class AppleSpeechProvider: TranscriptionProvider, @unchecked Sendable {
     }
 
     func load(from cacheDir: URL, progressHandler: (@Sendable (Double, String) -> Void)?) async throws {
+        #if compiler(>=6.2)
+        guard #available(macOS 26, *) else { throw TranscriptionError.loadFailed }
         let languageCode = await MainActor.run { TypedSettings[.selectedLanguage] }
         let locale = Self.locale(for: languageCode)
 
         try await prepareForLocale(locale, progressHandler: progressHandler)
         state.withLock { $0.ready = true }
         progressHandler?(1.0, "Ready")
+        #else
+        throw TranscriptionError.loadFailed
+        #endif
     }
 
+    #if compiler(>=6.2)
     /// Ensures the speech asset for `locale` is installed and rebuilds the
     /// converter/analyzerFormat for it. Shared by `load()` and `transcribe()`
     /// so a language switch without a model switch re-preares the provider
     /// instead of transcribing in the stale locale.
+    @available(macOS 26, *)
     private func prepareForLocale(
         _ locale: Locale,
         progressHandler: (@Sendable (Double, String) -> Void)?
@@ -78,8 +96,11 @@ final class AppleSpeechProvider: TranscriptionProvider, @unchecked Sendable {
             $0.preparedLocale = locale
         }
     }
+    #endif
 
     func transcribe(samples: [Float], language: String?) async throws -> String {
+        #if compiler(>=6.2)
+        guard #available(macOS 26, *) else { throw TranscriptionError.loadFailed }
         let initialState = state.withLock { $0 }
         guard initialState.ready else { throw TranscriptionError.loadFailed }
 
@@ -151,6 +172,9 @@ final class AppleSpeechProvider: TranscriptionProvider, @unchecked Sendable {
         }
 
         return finalText.withLock { $0 }.trimmingCharacters(in: .whitespacesAndNewlines)
+        #else
+        throw TranscriptionError.loadFailed
+        #endif
     }
 
     private func cancelResultsTask(_ resultsTask: Task<Void, any Error>) async {

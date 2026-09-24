@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(FoundationModels)
 import FoundationModels
+#endif
 import os
 
 /// Cleans up a raw ASR transcript (punctuation, filler words, self-corrections,
@@ -118,13 +120,17 @@ struct AppleIntelligencePostProcessor: PostProcessingProvider {
     }
 
     var isAvailable: Bool {
-        if case .available = SystemLanguageModel.default.availability {
+        #if canImport(FoundationModels)
+        if #available(macOS 26, *), case .available = SystemLanguageModel.default.availability {
             return true
         }
+        #endif
         return false
     }
 
     func process(_ transcript: String) async throws -> String {
+        #if canImport(FoundationModels)
+        guard #available(macOS 26, *) else { throw CocoaError(.featureUnsupported) }
         let session = LanguageModelSession(
             model: SystemLanguageModel.default,
             instructions: Self.instructions
@@ -136,5 +142,8 @@ struct AppleIntelligencePostProcessor: PostProcessingProvider {
             options: GenerationOptions(sampling: .greedy)
         )
         return response.content
+        #else
+        throw CocoaError(.featureUnsupported)
+        #endif
     }
 }

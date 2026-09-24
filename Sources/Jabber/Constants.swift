@@ -49,7 +49,8 @@ enum Constants {
     }
 
     /// Languages offered by Jabber. Model compatibility is resolved separately
-    /// by `LanguageModelCatalog`.
+    /// by `LanguageModelCatalog`; languages no model on this Mac covers (those
+    /// only Apple Speech handles, before macOS 26) are left out.
     static let languages: [String: String] = [
         "arabic": "ar",
         "belarusian": "be",
@@ -98,7 +99,7 @@ enum Constants {
         "turkish": "tr",
         "ukrainian": "uk",
         "vietnamese": "vi"
-    ]
+    ].filter { !LanguageModelCatalog.routes(for: $0.value).isEmpty }
 
     /// some language codes have multiple names; pick one for UI
     private static let preferredLanguageNameByCode: [String: String] = [

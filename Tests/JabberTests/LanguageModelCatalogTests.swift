@@ -8,10 +8,11 @@ final class LanguageModelCatalogTests: XCTestCase {
         XCTAssertEqual(route.first?.modelId, AppMode.parakeetModelId)
         XCTAssertTrue(route.first?.isRecommended == true)
         XCTAssertTrue(route.contains { $0.modelId == AppMode.nemotronModelId })
-        XCTAssertTrue(route.contains { $0.modelId == AppMode.appleSpeechModelId })
+        XCTAssertEqual(route.contains { $0.modelId == AppMode.appleSpeechModelId }, AppleSpeechProvider.isSupported)
     }
 
-    func testAutoDetectRecommendsAppleSpeech() {
+    func testAutoDetectRecommendsAppleSpeech() throws {
+        try XCTSkipUnless(AppleSpeechProvider.isSupported, "Apple Speech needs macOS 26")
         let route = LanguageModelCatalog.routes(for: "auto")
 
         XCTAssertEqual(route.first?.modelId, AppMode.appleSpeechModelId)
@@ -20,7 +21,8 @@ final class LanguageModelCatalogTests: XCTestCase {
         XCTAssertTrue(route.contains { $0.modelId == AppMode.nemotronModelId })
     }
 
-    func testLanguageOutsideEveryLocalModelOnlyOffersAppleSpeech() {
+    func testLanguageOutsideEveryLocalModelOnlyOffersAppleSpeech() throws {
+        try XCTSkipUnless(AppleSpeechProvider.isSupported, "Apple Speech needs macOS 26")
         // Chinese has no local model; v3 is European-only and the Japanese
         // model is monolingual.
         XCTAssertEqual(
@@ -38,7 +40,7 @@ final class LanguageModelCatalogTests: XCTestCase {
 
         XCTAssertEqual(route.first?.modelId, AppMode.parakeetJapaneseModelId)
         XCTAssertTrue(route.first?.isRecommended == true)
-        XCTAssertTrue(route.contains { $0.modelId == AppMode.appleSpeechModelId })
+        XCTAssertEqual(route.contains { $0.modelId == AppMode.appleSpeechModelId }, AppleSpeechProvider.isSupported)
         XCTAssertFalse(
             LanguageModelCatalog.supportsLanguage("en", modelId: AppMode.parakeetJapaneseModelId)
         )
@@ -62,7 +64,7 @@ final class LanguageModelCatalogTests: XCTestCase {
                 AppMode.parakeetMultilingualModelId,
                 name
             )
-            XCTAssertTrue(route.contains { $0.modelId == AppMode.appleSpeechModelId }, name)
+            XCTAssertEqual(route.contains { $0.modelId == AppMode.appleSpeechModelId }, AppleSpeechProvider.isSupported, name)
         }
     }
 
@@ -119,9 +121,19 @@ final class LanguageModelCatalogTests: XCTestCase {
         }
     }
 
-    func testAppleSpeechSupportsAllLanguages() {
+    func testAppleSpeechSupportsAllLanguages() throws {
+        try XCTSkipUnless(AppleSpeechProvider.isSupported, "Apple Speech needs macOS 26")
         for code in Constants.validLanguageCodes {
             XCTAssertTrue(LanguageModelCatalog.supportsLanguage(code, modelId: AppMode.appleSpeechModelId))
+        }
+    }
+
+    func testEveryOfferedLanguageRecommendsAModelThisMacHas() {
+        // Before macOS 26 Apple Speech is hidden, so "auto" must promote
+        // another model and languages only Apple Speech covers are not offered.
+        for code in Constants.validLanguageCodes.union(["auto"]) {
+            let recommended = LanguageModelCatalog.recommendedModelId(for: code)
+            XCTAssertNotNil(AppMode.modelDefinition(for: recommended), code)
         }
     }
 
