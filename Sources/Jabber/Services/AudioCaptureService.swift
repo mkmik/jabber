@@ -188,12 +188,15 @@ final class AudioCaptureService {
 
     private func configureInputDevice(_ inputNode: AVAudioInputNode) throws {
         let selectedUID = TypedSettings[.inputDeviceUID]
-        guard !selectedUID.isEmpty else {
+        // The engine outlives device changes, so "system default" has to be
+        // set explicitly too; it would otherwise keep the last chosen device.
+        let resolvedDeviceID = selectedUID.isEmpty
+            ? inputDeviceMonitor.defaultDeviceID
+            : inputDeviceMonitor.deviceID(forUID: selectedUID)
+        guard var deviceID = resolvedDeviceID else {
+            guard selectedUID.isEmpty else { throw AudioCaptureError.selectedInputUnavailable }
             configuredInputDeviceID = nil
             return
-        }
-        guard var deviceID = inputDeviceMonitor.deviceID(forUID: selectedUID) else {
-            throw AudioCaptureError.selectedInputUnavailable
         }
         guard let audioUnit = inputNode.audioUnit else {
             throw AudioCaptureError.inputDeviceSelectionUnavailable
@@ -210,7 +213,7 @@ final class AudioCaptureService {
         guard status == noErr else {
             throw AudioCaptureError.couldNotSelectInput(status)
         }
-        configuredInputDeviceID = deviceID
+        configuredInputDeviceID = selectedUID.isEmpty ? nil : deviceID
     }
 
     func startCapture() throws {
@@ -279,8 +282,15 @@ final class AudioCaptureService {
 
     private func requestInputRebuild(reason: InputRebuildReason) {
         needsRebuild = true
-        guard isPrepared || isCapturing else {
-            logger.notice("Deferring input rebuild until capture is prepared")
+        guard isCapturing else {
+            // Rebuilding while idle opens the input, which flips a Bluetooth
+            // headset into its headset profile and fires another configuration
+            // change: an endless rebuild loop. Release the input and rebuild
+            // when the next dictation starts.
+            if isPrepared {
+                teardownEngine()
+            }
+            logger.notice("Deferring input rebuild after \(reason, privacy: .public) until the next dictation")
             return
         }
         guard inputRecoveryTask == nil else {
@@ -408,7 +418,9 @@ final class AudioCaptureService {
         setConverter(nil)
         captureState.withLock { $0.preRollSamples.removeAll() }
         isPrepared = false
-        engineStorage = nil
+        // The engine itself is kept for the app's lifetime. Releasing it while
+        // CoreAudio is still announcing a device change crashes: AVAudioEngine
+        // queues those announcements without keeping itself alive.
     }
 
     func stopCapture() {
@@ -427,11 +439,10 @@ final class AudioCaptureService {
         firstBufferWatchdogTask = nil
         drainConverter()
 
-        // The engine stays built either way. A route change invalidated the
-        // tap, so rebuild now rather than keeping a stale one warm.
+        // A route change invalidated the tap: release it now and rebuild when
+        // the next dictation starts rather than keep a stale one warm.
         guard !needsRebuild else {
             teardownEngine()
-            prepare()
             return
         }
         scheduleStandbyRetirement()
