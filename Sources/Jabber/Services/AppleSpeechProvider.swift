@@ -38,7 +38,9 @@ final class AppleSpeechProvider: TranscriptionProvider, @unchecked Sendable {
 
     /// SpeechAnalyzer and its transcribers ship with macOS 26.
     static var isSupported: Bool {
-        if #available(macOS 26, *) { return true }
+        if #available(macOS 26, *) {
+            return true
+        }
         return false
     }
 
@@ -56,7 +58,7 @@ final class AppleSpeechProvider: TranscriptionProvider, @unchecked Sendable {
     /// installed, and rebuilds the converter/analyzerFormat for it. Shared by
     /// `load()` and `transcribe()` so a language switch without a model switch
     /// re-prepares the provider instead of transcribing in the stale locale.
-@available(macOS 26, *)
+    @available(macOS 26, *)
     private func prepareForLocale(
         _ locale: Locale,
         progressHandler: (@Sendable (Double, String) -> Void)?
