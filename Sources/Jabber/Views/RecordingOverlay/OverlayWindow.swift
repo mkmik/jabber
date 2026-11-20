@@ -7,7 +7,7 @@ class OverlayWindowController {
     var window: NSPanel?
     var visibilityToken: UInt64 = 0
     let animationDuration: TimeInterval
-    private var isHiding = false
+    private(set) var isHiding = false
 
     init(animationDuration: TimeInterval) {
         self.animationDuration = animationDuration
@@ -93,12 +93,30 @@ class OverlayWindowController {
 @MainActor
 class OverlayWindow: OverlayWindowController {
     var waveformView: WaveformView?
-    private var hostingView: NSHostingView<WaveformContainer>?
+    private var hostingView: FirstMouseHostingView<WaveformContainer>?
+    /// The overlay's cancel button was clicked.
+    var onCancel: (() -> Void)?
     private let logger = Logger(subsystem: "com.rselbach.jabber", category: "OverlayWindow")
 
     /// When `hide()` is called while a fallback notice is on screen, the hide
     /// is deferred until the notice auto-clears so the user has time to read it.
     private var pendingHide = false
+
+    /// Fires whenever the fallback notice clears, after any deferred hide has
+    /// started, so the owner can restore UI the notice displaced. Not fired
+    /// when a new session's `show()` drops the notice.
+    var onFallbackNoticeCleared: (() -> Void)?
+
+    var hasActiveFallbackNotice: Bool {
+        waveformView?.hasActiveFallbackNotice == true
+    }
+
+    /// A dictation session has the overlay up. Once the overlay is hidden,
+    /// hiding, or waiting on a deferred hide, no session owns it: the session
+    /// ended or only a notice is showing.
+    private var isSessionOnScreen: Bool {
+        window?.isVisible == true && !isHiding && !pendingHide
+    }
 
     init() {
         super.init(animationDuration: 0.2)
@@ -138,12 +156,26 @@ class OverlayWindow: OverlayWindowController {
         waveformView?.showRefining()
     }
 
-    /// Shows a brief, non-disruptive red notice on the overlay when
-    /// post-processing fell back to the raw transcript. The overlay is already
-    /// on screen (we are mid-transcription/refining), so this only updates the
-    /// waveform view; it does not reset existing state.
-    func showFallbackNotice(_ text: String) {
-        waveformView?.showFallbackNotice(text)
+    /// Shows a brief, non-disruptive notice on the overlay. While a dictation
+    /// session has the overlay up, the notice covers the live content until it
+    /// clears and the session's own hide waits for it; recording and
+    /// transcription carry on underneath. Otherwise the panel comes up just
+    /// for the notice and hides once it clears; a session that starts in the
+    /// meantime takes the panel over and drops the notice.
+    func showFallbackNotice(title: String, message: String) {
+        let showsForNotice = !isSessionOnScreen
+        if showsForNotice {
+            show()
+        }
+        guard let waveformView else {
+            logger.error("Dropped overlay notice \(title, privacy: .public): no overlay panel")
+            return
+        }
+        waveformView.showFallbackNotice(title: title, message: message)
+        if showsForNotice {
+            // Deferred while the notice is up; its auto-clear finishes the hide.
+            hide()
+        }
     }
 
     override func hide() {
@@ -158,13 +190,23 @@ class OverlayWindow: OverlayWindowController {
     }
 
     func fallbackNoticeCleared() {
-        guard pendingHide else { return }
-        pendingHide = false
-        super.hide()
+        if pendingHide {
+            pendingHide = false
+            super.hide()
+        }
+        onFallbackNoticeCleared?()
     }
 
     func setTargetAppIcon(_ icon: NSImage?) {
         waveformView?.setTargetAppIcon(icon)
+    }
+
+    func setInputDeviceName(_ name: String?) {
+        waveformView?.setInputDeviceName(name)
+    }
+
+    func startRecordingClock(limit: TimeInterval) {
+        waveformView?.startRecordingClock(limit: limit)
     }
 
     @discardableResult
@@ -177,8 +219,10 @@ class OverlayWindow: OverlayWindowController {
         waveform.onFallbackNoticeCleared = { [weak self] in
             self?.fallbackNoticeCleared()
         }
-        let container = WaveformContainer(waveformView: waveform)
-        let hostingView = NSHostingView(rootView: container)
+        let container = WaveformContainer(waveformView: waveform) { [weak self] in
+            self?.onCancel?()
+        }
+        let hostingView = FirstMouseHostingView(rootView: container)
         hostingView.frame = NSRect(x: 0, y: 0, width: frame.width, height: frame.height)
 
         panel.contentView = hostingView
@@ -207,6 +251,15 @@ class OverlayWindow: OverlayWindowController {
         let y = screenFrame.origin.y + bottomMargin
 
         return NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
+    }
+}
+
+/// The overlay panel never becomes key or activates Jabber, so every click
+/// on it is a first click into an inactive window. Accepting it lets the
+/// cancel button work on the first press.
+final class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
     }
 }
 
@@ -251,6 +304,7 @@ enum OverlayScreenResolver {
 
 struct WaveformContainer: View {
     @ObservedObject var waveformView: WaveformView
+    let onCancel: () -> Void
 
     var body: some View {
         ZStack {
@@ -264,7 +318,48 @@ struct WaveformContainer: View {
                 }
 
                 content
+
+                if waveformView.fallbackNotice == nil, isSessionActive {
+                    HStack(spacing: 8) {
+                        if let startedAt = waveformView.recordingStartedAt {
+                            recordingClock(startedAt: startedAt)
+                        }
+                        cancelButton
+                    }
+                    .padding(.trailing, 12)
+                }
             }
+        }
+    }
+
+    /// Recording, transcribing, or refining: something the cancel button can
+    /// stop.
+    private var isSessionActive: Bool {
+        waveformView.recordingStartedAt != nil || waveformView.isProcessing
+    }
+
+    private var cancelButton: some View {
+        Button(action: onCancel) {
+            Image(systemName: "xmark.circle.fill")
+                .font(.title3)
+                .foregroundStyle(.secondary)
+        }
+        .buttonStyle(.plain)
+        .help("Cancel (Esc)")
+        .accessibilityLabel("Cancel Dictation")
+    }
+
+    /// Elapsed recording time, turning into an orange countdown shortly
+    /// before the session limit stops the recording.
+    private func recordingClock(startedAt: Date) -> some View {
+        TimelineView(.periodic(from: startedAt, by: 1)) { context in
+            let clock = RecordingClock(
+                elapsed: context.date.timeIntervalSince(startedAt),
+                limit: waveformView.recordingLimit
+            )
+            Text(clock.text)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(clock.isWarning ? Color.orange : Color.secondary)
         }
     }
 
@@ -274,6 +369,8 @@ struct WaveformContainer: View {
             fallbackNoticeView(notice)
         } else if waveformView.isProcessing {
             processingContent
+        } else if waveformView.isInputSilent {
+            silentInputContent
         } else if waveformView.partialTranscription.isEmpty {
             waveform
         } else {
@@ -281,17 +378,45 @@ struct WaveformContainer: View {
         }
     }
 
-    /// Brief, non-disruptive red indicator shown when post-processing fell
-    /// back to the raw transcript. Auto-clears (no click-to-dismiss UI).
-    private func fallbackNoticeView(_ text: String) -> some View {
-        HStack(spacing: 8) {
+    /// Brief, non-disruptive notice: a post-processing fallback or a message
+    /// that could not be posted as a system notification. Auto-clears (no
+    /// click-to-dismiss UI). One title line plus up to three message lines
+    /// fit the 400x104 panel.
+    private func fallbackNoticeView(_ notice: OverlayNotice) -> some View {
+        HStack(spacing: 10) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.red)
-            Text(text)
-                .font(.subheadline)
-                .foregroundStyle(.red)
-                .lineLimit(2)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(notice.title)
+                    .font(.headline)
+                    .lineLimit(1)
+                Text(notice.message)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 12)
+    }
+
+    /// Recording carries on; this only says nothing is coming in, and clears
+    /// as soon as the microphone delivers sound.
+    private var silentInputContent: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "mic.slash.fill")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(waveformView.inputDeviceName.map { "No sound from \($0)" } ?? "No sound from the microphone")
+                    .font(.headline)
+                    .lineLimit(1)
+                Text("Check that it's unmuted, or pick another input in Settings.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 12)

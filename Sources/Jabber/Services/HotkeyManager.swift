@@ -6,6 +6,8 @@ import os
 
 final class HotkeyManager: @unchecked Sendable {
     private var hotKeyRef: EventHotKeyRef?
+    /// Escape, claimed only while a dictation session runs. Held under `lock`.
+    private var cancelHotKeyRef: EventHotKeyRef?
     private var eventHandlerRef: EventHandlerRef?
     private var isDeinitialized = false
     private let lock = NSLock()
@@ -47,6 +49,11 @@ final class HotkeyManager: @unchecked Sendable {
 
     var onKeyDown: (@MainActor () -> Void)?
     var onKeyUp: (@MainActor () -> Void)?
+    /// Another key joined a held lone-modifier shortcut after it fired, so the
+    /// press was a combo rather than a dictation.
+    var onDiscard: (@MainActor () -> Void)?
+    /// Escape was pressed while the cancel key was registered.
+    var onCancelKey: (@MainActor () -> Void)?
     var onRegistrationFailure: (@MainActor (OSStatus) -> Void)? {
         didSet {
             replayPendingRegistrationFailure()
@@ -61,6 +68,7 @@ final class HotkeyManager: @unchecked Sendable {
         lock.lock()
         isDeinitialized = true
         let ref = hotKeyRef
+        let cancelRef = cancelHotKeyRef
         let handler = eventHandlerRef
         let tap = eventTap
         let source = runLoopSource
@@ -68,7 +76,7 @@ final class HotkeyManager: @unchecked Sendable {
         modifierOnlyDebounce = nil
         lock.unlock()
 
-        if let ref {
+        for ref in [ref, cancelRef].compactMap({ $0 }) {
             let status = UnregisterEventHotKey(ref)
             if status != noErr {
                 logger.error("Failed to unregister hotkey with status: \(status)")
@@ -184,6 +192,47 @@ final class HotkeyManager: @unchecked Sendable {
         return isDeinitialized
     }
 
+    /// Claims Escape so it can cancel the session in progress. Registered only
+    /// while a session runs, so Escape keeps working in other apps the rest of
+    /// the time. A failure only costs the Escape shortcut; the overlay's
+    /// cancel button still works, so it is logged rather than surfaced.
+    func registerCancelKey() {
+        guard let signature = OSType(fourCharCode: "JBBR") else {
+            logger.error("Failed to create cancel hotkey signature")
+            return
+        }
+
+        lock.lock()
+        defer { lock.unlock() }
+        guard cancelHotKeyRef == nil else { return }
+
+        let status = RegisterEventHotKey(
+            UInt32(kVK_Escape),
+            0,
+            EventHotKeyID(signature: signature, id: CarbonHotkeyRoute.cancelHotKeyID),
+            GetApplicationEventTarget(),
+            0,
+            &cancelHotKeyRef
+        )
+        if status != noErr {
+            cancelHotKeyRef = nil
+            logger.error("Failed to register Escape as the cancel hotkey with status: \(status)")
+        }
+    }
+
+    func unregisterCancelKey() {
+        lock.lock()
+        let ref = cancelHotKeyRef
+        cancelHotKeyRef = nil
+        lock.unlock()
+
+        guard let ref else { return }
+        let status = UnregisterEventHotKey(ref)
+        if status != noErr {
+            logger.error("Failed to unregister the cancel hotkey with status: \(status)")
+        }
+    }
+
     @discardableResult
     private func registerCarbon(keyCode: UInt32, modifiers: UInt32) -> OSStatus {
         guard let signature = OSType(fourCharCode: "JBBR") else {
@@ -195,7 +244,7 @@ final class HotkeyManager: @unchecked Sendable {
 
         let hotKeyID = EventHotKeyID(
             signature: signature,
-            id: 1
+            id: CarbonHotkeyRoute.dictationHotKeyID
         )
 
         lock.lock()
@@ -374,7 +423,7 @@ final class HotkeyManager: @unchecked Sendable {
         dispatchGesture(gestureAction)
 
         if let tap = reenableTap {
-            logger.warning("CGEventTap disabled by system (\(String(describing: type))); re-enabling (\(reenableCount) recent disable(s)). If this repeats, Accessibility permission is likely missing.")
+            logger.warning("CGEventTap disabled by system (\(String(describing: type), privacy: .public)); re-enabling (\(reenableCount) recent disable(s)). If this repeats, Accessibility permission is likely missing.")
             CGEvent.tapEnable(tap: tap, enable: true)
         } else if teardownTap != nil {
             if let tap = teardownTap {
@@ -386,7 +435,7 @@ final class HotkeyManager: @unchecked Sendable {
                 CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
             }
             teardownDebounce?.cancel()
-            logger.error("CGEventTap repeatedly disabled by system (\(String(describing: type))); giving up re-enable after \(EventTapReenablePolicy.maxReenables) rapid disables. Accessibility permission was likely revoked.")
+            logger.error("CGEventTap repeatedly disabled by system (\(String(describing: type), privacy: .public)); giving up re-enable after \(EventTapReenablePolicy.maxReenables) rapid disables. Accessibility permission was likely revoked.")
             dispatchRegistrationFailure(OSStatus(eventNotHandledErr))
         }
         // `eventTapDead` already latched: the tap is gone, nothing left to do.
@@ -452,17 +501,18 @@ final class HotkeyManager: @unchecked Sendable {
             ) else {
                 return Unmanaged.passUnretained(event)
             }
-            logger.debug("Event tap flagsChanged keyCode=\(keyCode) gestureState=\(String(describing: gestureState)) input=\(String(describing: gestureInput))")
+            logger.debug("Event tap flagsChanged keyCode=\(keyCode) gestureState=\(String(describing: gestureState), privacy: .public) input=\(String(describing: gestureInput), privacy: .public)")
             feed(gestureInput)
 
         case .keyDown:
             // Modifier keys surface as flagsChanged, not keyDown; any other
             // key-down while the modifier is held means the user is typing a
-            // combo (e.g. Option+E), so we cancel the pending start.
+            // combo (e.g. Option+E), so we cancel the pending start, or
+            // discard the recording if it already started.
             guard !HotkeyShortcut.modifierOnlyKeyCodes.contains(keyCode) else {
                 return Unmanaged.passUnretained(event)
             }
-            logger.debug("Event tap keyDown keyCode=\(keyCode) (combo typing; cancelling pending modifier-only start)")
+            logger.debug("Event tap keyDown keyCode=\(keyCode) (combo typing; cancelling modifier-only gesture)")
             feed(.otherKeyDown)
 
         default:
@@ -533,6 +583,9 @@ final class HotkeyManager: @unchecked Sendable {
         case .fireUp:
             logger.info("Modifier-only gesture fired: onKeyUp")
             Self.deliverToMain { self.onKeyUp?() }
+        case .fireDiscard:
+            logger.info("Modifier-only gesture fired: onDiscard")
+            Self.deliverToMain { self.onDiscard?() }
         case .scheduleStart, .cancelStart, .none:
             break
         }
@@ -562,13 +615,36 @@ final class HotkeyManager: @unchecked Sendable {
                 guard !manager.isDeinit() else { return OSStatus(eventNotHandledErr) }
 
                 let kind = GetEventKind(event)
+                guard kind == UInt32(kEventHotKeyPressed) || kind == UInt32(kEventHotKeyReleased) else {
+                    return noErr
+                }
 
-                if kind == UInt32(kEventHotKeyPressed) {
+                var hotKeyID = EventHotKeyID()
+                let parameterStatus = GetEventParameter(
+                    event,
+                    EventParamName(kEventParamDirectObject),
+                    EventParamType(typeEventHotKeyID),
+                    nil,
+                    MemoryLayout<EventHotKeyID>.size,
+                    nil,
+                    &hotKeyID
+                )
+                guard parameterStatus == noErr else {
+                    manager.logger.error("Failed to read hotkey ID with status: \(parameterStatus)")
+                    return OSStatus(eventNotHandledErr)
+                }
+
+                switch CarbonHotkeyRoute.route(hotKeyID: hotKeyID.id, isPressed: kind == UInt32(kEventHotKeyPressed)) {
+                case .dictationDown:
                     manager.setCarbonHotkeyDown(true)
                     HotkeyManager.deliverToMain { manager.onKeyDown?() }
-                } else if kind == UInt32(kEventHotKeyReleased) {
+                case .dictationUp:
                     manager.setCarbonHotkeyDown(false)
                     HotkeyManager.deliverToMain { manager.onKeyUp?() }
+                case .cancel:
+                    HotkeyManager.deliverToMain { manager.onCancelKey?() }
+                case .ignore:
+                    break
                 }
 
                 return noErr
@@ -623,9 +699,13 @@ private extension OSType {
 /// - If the modifier is released while pending, the start is cancelled
 ///   (`cancelStart`, or `.none` if another key already cancelled it); nothing
 ///   fires.
-/// - Once active, a non-modifier key press is ignored (no re-fire); releasing
-///   the modifier still asks the caller to fire `onKeyUp` (`fireUp`) so the
-///   existing activation modes (hold / automatic push-to-talk) keep working.
+/// - Once active, the first other key press asks the caller to discard the
+///   recording (`fireDiscard`): the user was typing a combo, not dictating,
+///   and only held the modifier a little long. Releasing the modifier still
+///   asks the caller to fire `onKeyUp` (`fireUp`) so the existing activation
+///   modes (hold / automatic push-to-talk) keep working.
+/// - Another modifier pressed while the configured one is held counts as an
+///   other key, so a lone-modifier shortcut never fires inside a chord.
 struct ModifierOnlyGestureReducer: Sendable, Equatable {
     enum State: Sendable, Equatable {
         case idle
@@ -639,6 +719,7 @@ struct ModifierOnlyGestureReducer: Sendable, Equatable {
         case cancelStart
         case fireDown
         case fireUp
+        case fireDiscard
     }
 
     enum Input: Sendable, Equatable {
@@ -709,9 +790,11 @@ struct ModifierOnlyGestureReducer: Sendable, Equatable {
                 otherKeyPressedDuringModifier = true
                 return .cancelStart
             case .active:
-                // Already recording: ignore (no re-fire).
+                // Recording started, but the user is typing a combo: discard
+                // it once, then ignore further keys (no re-fire).
+                let isFirstOtherKey = !otherKeyPressedDuringModifier
                 otherKeyPressedDuringModifier = true
-                return .none
+                return isFirstOtherKey ? .fireDiscard : .none
             case .idle:
                 return .none
             }
@@ -762,18 +845,22 @@ struct ModifierOnlyGestureReducer: Sendable, Equatable {
     ///   sibling keeps the family flag high → `.modifierUp`.
     /// - Family flag cleared → the configured key (and any sibling) is up →
     ///   `.modifierUp`.
-    /// - Event for any key code other than the configured one (e.g. a sibling
-    ///   modifier) → `nil` (ignored).
+    /// - Press of another modifier (a sibling included) while the configured
+    ///   key is tracked down → `.otherKeyDown`, so the gesture treats the
+    ///   chord like combo typing. A press is told from a release by the
+    ///   event's per-side device bit, since the family flag stays high while
+    ///   a sibling is held.
+    /// - Any other event for another key code → `nil` (ignored).
     static func input(
         forFlagsChanged keyCode: UInt32,
         flags: CGEventFlags,
         shortcutKeyCode: UInt32,
         gestureState: State
     ) -> Input? {
-        // Only the configured physical key drives the gesture; sibling-modifier
-        // events (e.g. Left Option when Right Option is configured) are ignored.
-        guard keyCode == shortcutKeyCode else { return nil }
-
+        guard keyCode == shortcutKeyCode else {
+            guard gestureState != .idle, isPress(ofModifier: keyCode, flags: flags) else { return nil }
+            return .otherKeyDown
+        }
         guard let familyFlag = HotkeyShortcut.cgEventFlag(forKeyCode: keyCode) else {
             return nil
         }
@@ -789,6 +876,33 @@ struct ModifierOnlyGestureReducer: Sendable, Equatable {
         // already tracked down: a key cannot press twice, so the latter is the
         // configured-side release with a sibling still holding the family flag.
         return .modifierUp
+    }
+
+    /// Per-side device bits CoreGraphics sets in `CGEventFlags` alongside
+    /// the family flag (IOKit's `NX_DEVICE*KEYMASK`).
+    private static func deviceFlagMask(forKeyCode keyCode: UInt32) -> UInt64? {
+        switch keyCode {
+        case UInt32(kVK_Control): return 0x0001
+        case UInt32(kVK_Shift): return 0x0002
+        case UInt32(kVK_RightShift): return 0x0004
+        case UInt32(kVK_Command): return 0x0008
+        case UInt32(kVK_RightCommand): return 0x0010
+        case UInt32(kVK_Option): return 0x0020
+        case UInt32(kVK_RightOption): return 0x0040
+        case UInt32(kVK_RightControl): return 0x2000
+        default: return nil
+        }
+    }
+
+    /// Whether a `flagsChanged` for modifier `keyCode` is its press. Fn has
+    /// no sides, so its family flag decides. Events without the device bit
+    /// read as releases, which leaves the gesture alone.
+    private static func isPress(ofModifier keyCode: UInt32, flags: CGEventFlags) -> Bool {
+        if let mask = deviceFlagMask(forKeyCode: keyCode) {
+            return flags.rawValue & mask != 0
+        }
+        guard keyCode == UInt32(kVK_Function) else { return false }
+        return flags.contains(.maskSecondaryFn)
     }
 }
 
@@ -842,5 +956,94 @@ enum EventTapReenablePolicy: Sendable {
         let updated = inWindow + [newDisableTime]
         let reenable = updated.count <= maxReenables
         return (updated, reenable)
+    }
+}
+
+/// Pure decision logic for re-registering a modifier-only shortcut once
+/// Accessibility permission is granted.
+///
+/// The modifier-only CGEventTap needs Accessibility, and registration
+/// otherwise runs only at launch, on shortcut change, and after hotkey
+/// capture. Without a retry, granting (or re-granting, e.g. after an update
+/// reset the grant) Accessibility in System Settings leaves the hotkey dead
+/// until relaunch. The caller records each failure here, re-checks trust
+/// every `pollInterval` while `isPending`, and resets the policy on success
+/// or whenever it registers a shortcut itself.
+///
+/// A retry fires only when trust is observed going from untrusted to
+/// trusted, so every retry follows a change in System Settings. A failure
+/// while already trusted (tap creation failing despite the grant, or the tap
+/// torn down after repeated timeouts) waits for Accessibility to be toggled
+/// rather than retrying on a schedule: the tap is a `.defaultTap` at the head
+/// of the session event stream, and re-creating it while the main thread
+/// keeps stalling would delay every keystroke system-wide again.
+///
+/// Only the first failure of an episode asks the caller to notify the user;
+/// failed automatic retries stay silent.
+struct ModifierOnlyRegistrationRetryPolicy: Sendable {
+    /// How often the caller re-checks Accessibility trust while pending.
+    static let pollInterval: Duration = .seconds(2)
+
+    /// Trust last observed during the pending episode; `nil` when nothing is
+    /// pending.
+    private var lastObservedTrust: Bool?
+
+    var isPending: Bool {
+        lastObservedTrust != nil
+    }
+
+    /// Record a failed registration. Returns `true` when the caller should
+    /// notify the user: always for a Carbon shortcut (it never needs
+    /// Accessibility, so there is nothing to retry), and for the first failure
+    /// of a modifier-only episode.
+    mutating func recordFailure(isModifierOnly: Bool, isTrusted: Bool) -> Bool {
+        guard isModifierOnly else {
+            lastObservedTrust = nil
+            return true
+        }
+        let isNewEpisode = lastObservedTrust == nil
+        lastObservedTrust = isTrusted
+        return isNewEpisode
+    }
+
+    /// Record a trust check. Returns `true` when the caller should
+    /// re-register: an episode is pending and trust just went from untrusted
+    /// to trusted.
+    mutating func recordTrust(_ isTrusted: Bool) -> Bool {
+        guard let wasTrusted = lastObservedTrust else { return false }
+        lastObservedTrust = isTrusted
+        return !wasTrusted && isTrusted
+    }
+
+    /// End the episode after a successful registration or when a new
+    /// registration replaces the pending one.
+    mutating func reset() {
+        lastObservedTrust = nil
+    }
+}
+
+/// What a Carbon hotkey event means. Two hotkeys share one event handler: the
+/// dictation shortcut, and Escape, which is registered only while a session
+/// runs so it can cancel it. Pure so the dispatch is testable without the
+/// Carbon event loop.
+enum CarbonHotkeyRoute: Equatable {
+    case dictationDown
+    case dictationUp
+    case cancel
+    case ignore
+
+    static let dictationHotKeyID: UInt32 = 1
+    static let cancelHotKeyID: UInt32 = 2
+
+    static func route(hotKeyID: UInt32, isPressed: Bool) -> CarbonHotkeyRoute {
+        switch hotKeyID {
+        case dictationHotKeyID:
+            return isPressed ? .dictationDown : .dictationUp
+        case cancelHotKeyID:
+            // Cancel on press; the release has nothing left to do.
+            return isPressed ? .cancel : .ignore
+        default:
+            return .ignore
+        }
     }
 }

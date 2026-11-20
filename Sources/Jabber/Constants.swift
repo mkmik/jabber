@@ -20,6 +20,8 @@ enum Constants {
 
         /// Posted when a model download starts/progresses/finishes
         static let modelDownloadStateDidChange = Notification.Name("com.rselbach.jabber.modelDownloadStateDidChange")
+        /// Dictation history gained, lost, or changed entries. Posted on the main actor.
+        static let dictationHistoryDidChange = Notification.Name("com.rselbach.jabber.dictationHistoryDidChange")
 
         /// Posted when an input device connects, disconnects, or becomes the
         /// system default.
@@ -65,8 +67,6 @@ enum Constants {
         "dutch": "nl",
         "english": "en",
         "estonian": "et",
-        "farsi": "fa",
-        "filipino": "fil",
         "finnish": "fi",
         "flemish": "nl",
         "french": "fr",
@@ -80,11 +80,9 @@ enum Constants {
         "korean": "ko",
         "latvian": "lv",
         "lithuanian": "lt",
-        "macedonian": "mk",
         "malay": "ms",
         "maltese": "mt",
         "mandarin": "zh",
-        "persian": "fa",
         "polish": "pl",
         "portuguese": "pt",
         "romanian": "ro",
@@ -94,7 +92,6 @@ enum Constants {
         "slovenian": "sl",
         "spanish": "es",
         "swedish": "sv",
-        "tagalog": "fil",
         "thai": "th",
         "turkish": "tr",
         "ukrainian": "uk",
@@ -104,8 +101,6 @@ enum Constants {
     /// some language codes have multiple names; pick one for UI
     private static let preferredLanguageNameByCode: [String: String] = [
         "es": "spanish",
-        "fa": "persian",
-        "fil": "filipino",
         "nl": "dutch",
         "ro": "romanian",
         "zh": "chinese"

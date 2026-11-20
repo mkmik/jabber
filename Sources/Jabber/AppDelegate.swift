@@ -8,7 +8,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Disabled first menu item mirroring the current app state; refreshed on
     /// every menu open.
     private var statusHeaderItem: NSMenuItem?
+    private var dictationToggleItem: NSMenuItem?
+    private var lastTranscriptItem: NSMenuItem?
+    private var recentTranscriptsItem: NSMenuItem?
+    /// Shown only while the coordinator keeps a failed dictation; refreshed on
+    /// every menu open.
+    private var retryFailedDictationItem: NSMenuItem?
+    private var discardFailedDictationItem: NSMenuItem?
+    /// Shown only after a model load failed; refreshed on every menu open.
+    private var retryModelLoadItem: NSMenuItem?
+    private var redownloadModelItem: NSMenuItem?
+    /// Shown only while macOS withholds a permission dictation needs.
+    private var fixPermissionsItem: NSMenuItem?
+    /// Recent languages; rebuilt on every menu open.
+    private var languageItem: NSMenuItem?
     private var currentAppState: AppState = .ready
+    /// Download or load progress shown in the icon and menu header, when known.
+    private var currentProgress: Double?
+    /// The user hid the download overlay; progress stays in the menu bar
+    /// icon until the download or load ends.
+    private var isDownloadOverlayDismissed = false
     private var onboardingWindow: NSWindow?
     private var onboardingCoordinator: OnboardingCoordinator?
     private var mainWindow: NSWindow?
@@ -46,6 +65,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastPostProcessingFailureNotice = CFAbsoluteTime(0)
     private var didPromptAccessibility = false
     private static let automaticHotkeyHoldThreshold: TimeInterval = 0.4
+    /// Recording continues this long after a hotkey stop. Hex measured the
+    /// last word lost on 3 in 10 real clips released 100 ms early, and on none
+    /// released on time.
+    private static let hotkeyReleaseTail: Duration = .milliseconds(200)
+    /// A Hold press released sooner than this was a brushed key, not a
+    /// dictation: it is dropped before the overlay, sounds, or media pause.
+    private static let holdTapThreshold: Duration = .milliseconds(300)
 
     // Hotkey press tracking: a press that awaits microphone permission can
     // have its key released before `start()` runs, leaving a "stuck" recording.
@@ -58,6 +84,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var activeHotkeyPressMode: HotkeyActivationMode?
     private var automaticHotkeyPressStartedAt: CFAbsoluteTime?
     private var automaticHotkeyPressStartedRecording = false
+    /// Confirms a provisional Hold recording once it outlasts a tap.
+    private var provisionalConfirmTask: Task<Void, Never>?
+    /// Whether the current session's overlay, icon, and start cue are up. A
+    /// provisional recording has none until it is confirmed.
+    private var isRecordingUIShown = false
+
+    // A modifier-only shortcut that failed to register for lack of
+    // Accessibility is retried once the grant appears; the poll task exists
+    // only while the policy is pending.
+    private var hotkeyRetryPolicy = ModifierOnlyRegistrationRetryPolicy()
+    private var hotkeyRetryTask: Task<Void, Never>?
 
     private var modelState: TranscriptionService.State = .notReady
 
@@ -71,7 +108,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // `@AppStorage` reads never observe a pre-migration value and the
         // SettingsStore getters can stay pure (no writes during view updates).
         TypedSettings.migrateStoredValues()
-        _ = NotificationService.shared
+        // Before anything asks which models are installed.
+        ModelManager.shared.removeObsoleteDownloads()
+        setupOverlayNotices()
         setupMenuBar()
         setupHotkey()
         setupDictationCoordinator()
@@ -95,15 +134,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // download via its own model-download step. Starting the load task
         // here would pull a multi-GB default model the user may not pick.
         if !willShowOnboarding {
+            // Users who already answered get their recorded choice back with
+            // no prompt. New users are asked when the onboarding window closes
+            // (windowWillClose) so the prompt never covers the welcome screen.
+            NotificationService.shared.requestAuthorization()
             if let pendingNotice {
                 scheduleModelMigrationNoticePresentation(pendingNotice)
             } else if !startDeclinedModelMigrationFallbackIfNeeded() {
                 startModelLoadingTask()
             }
         }
+        // Replace the menu bar's placeholder state with the real one before
+        // any model state arrives; without a load in flight that is "no model",
+        // not "ready".
+        syncNonDictationUI(forceLoading: modelLoadTask != nil)
         scheduleUIReadyFallbackIfNeeded()
         scheduleFirstRunSetupPrompt()
         prepareAudioCaptureWhenReady()
+        expireDictationHistory()
+    }
+
+    /// Drops history that expired while Jabber wasn't running. Also loads
+    /// the shared history list, so Recent Transcripts is ready when the menu
+    /// first opens.
+    private func expireDictationHistory() {
+        let retention = TypedSettings.historyPreferences.retention
+        let history = DictationHistoryModel.shared
+        Task {
+            do {
+                try await history.applyRetention(retention)
+            } catch {
+                logger.error("Failed to expire dictation history: \(error.localizedDescription, privacy: .public)")
+            }
+        }
     }
 
     /// Builds the audio engine once the UI has settled so the hotkey path does
@@ -113,8 +176,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         audioPrepareTask?.cancel()
         audioPrepareTask = Task { @MainActor [weak self] in
             await AppReadinessGate.shared.waitForUIReady()
-            guard let self, !Task.isCancelled else { return }
-            guard permissionService.hasMicrophonePermission() else { return }
+            guard let self, !Task.isCancelled, permissionService.hasMicrophonePermission() else { return }
             audioCapture.prepare()
         }
     }
@@ -124,6 +186,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         firstRunSetupTask?.cancel()
         audioPrepareTask?.cancel()
         modelMigrationNoticeTask?.cancel()
+        hotkeyRetryTask?.cancel()
         onboardingCoordinator?.stop()
         dictationCoordinator.cancel()
         NotificationCenter.default.removeObserver(self)
@@ -162,6 +225,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self,
             selector: #selector(handleHotkeyCaptureEnd),
             name: Constants.Notifications.hotkeyCaptureDidEnd,
+            object: nil
+        )
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleApplicationDidBecomeActive),
+            name: NSApplication.didBecomeActiveNotification,
             object: nil
         )
 
@@ -212,7 +282,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let transcriptionService = appDelegate.transcriptionService
             await transcriptionService.setSessionModelOverride(nil)
             await transcriptionService.unloadModel()
-            if Task.isCancelled { return }
+            if Task.isCancelled {
+                return
+            }
             await appDelegate.loadModel()
         }
     }
@@ -235,26 +307,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } catch is CancellationError {
             return
         } catch {
-            logger.error("Failed to load model: \(error.localizedDescription)")
+            logger.error("Failed to load model: \(error.localizedDescription, privacy: .public)")
             modelState = .error(error.localizedDescription)
             syncNonDictationUI()
             showModelLoadError(error)
         }
     }
 
+    /// Loads usually fail at launch or after a model change, while the user is
+    /// in another app, so this reports without taking focus. The status menu
+    /// offers Retry Loading Model until a load succeeds.
     private func showModelLoadError(_ error: Error) {
-        let alert = NSAlert()
-        alert.messageText = "Failed to Load Model"
-        alert.informativeText = "The transcription model could not be loaded: \(error.localizedDescription)\n\nDictation is unavailable until a model loads successfully. Please check your internet connection and try restarting the app."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Retry")
-        alert.addButton(withTitle: "OK")
+        NotificationService.shared.showError(
+            title: "Couldn't Load Speech Model",
+            message: Self.modelLoadErrorMessage(
+                errorDescription: error.localizedDescription,
+                isModelDownloaded: isSelectedModelOnDisk()
+            )
+        )
+    }
 
-        NSApp.activate(ignoringOtherApps: true)
-        let response = alert.runModal()
-        if response == .alertFirstButtonReturn {
-            startModelLoadingTask()
+    /// A model whose files are on disk failed in loading, not downloading,
+    /// so the internet is not the suspect and new files may be the fix.
+    static func modelLoadErrorMessage(errorDescription: String, isModelDownloaded: Bool) -> String {
+        guard isModelDownloaded else {
+            return "\(errorDescription) Check your internet connection, then choose Retry Loading Model from the menu bar icon."
         }
+        return "\(errorDescription) Choose Retry Loading Model from the menu bar icon, or Re-download Model to replace its files."
+    }
+
+    /// Whether the selected model's files are installed, as opposed to
+    /// built in or still missing.
+    private func isSelectedModelOnDisk() -> Bool {
+        let modelManager = ModelManager.shared
+        guard AppMode.modelDefinition(for: modelManager.selectedModelId())?.isBuiltIn == false else { return false }
+        return modelManager.isSelectedModelDownloaded
+    }
+
+    @objc private func retryModelLoad() {
+        guard !isModelLoadInProgress else { return }
+        startModelLoadingTask()
+    }
+
+    /// Replaces the selected model's files; the finished download starts a
+    /// fresh load (handleModelDownloadState).
+    @objc private func redownloadModel() {
+        guard !isModelLoadInProgress else { return }
+        ModelManager.shared.redownloadModel(ModelManager.shared.selectedModelId())
     }
 
     private func handleModelState(_ state: TranscriptionService.State) {
@@ -264,42 +363,87 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .notReady, .loading, .ready:
             syncNonDictationUI()
         case .error(let message):
-            logger.error("Model error: \(message)")
+            logger.error("Model error: \(message, privacy: .public)")
             syncNonDictationUI()
         }
     }
 
-    private enum AppState {
+    enum AppState {
         case downloading
         case ready
         case recording
         case transcribing
         case error
+
+        var symbolName: String {
+            switch self {
+            case .downloading:
+                return "arrow.down.circle"
+            case .ready:
+                return "waveform"
+            case .recording:
+                return "waveform.circle.fill"
+            case .transcribing:
+                return "ellipsis.circle"
+            case .error:
+                return "exclamationmark.triangle"
+            }
+        }
+
+        /// Adds the download or load progress, when known, to what VoiceOver
+        /// reads for the icon.
+        func accessibilityDescription(progress: Double?) -> String {
+            guard self == .downloading, let progress else { return accessibilityDescription }
+            return "\(accessibilityDescription), \(Int(progress * 100)) percent"
+        }
+
+        /// What VoiceOver reads for the menu bar icon, which otherwise only
+        /// changes shape and color.
+        var accessibilityDescription: String {
+            switch self {
+            case .downloading:
+                return "Jabber, preparing speech model"
+            case .ready:
+                return "Jabber, ready to dictate"
+            case .recording:
+                return "Jabber, recording"
+            case .transcribing:
+                return "Jabber, transcribing"
+            case .error:
+                return "Jabber, model unavailable"
+            }
+        }
     }
 
-    private func updateStatusIcon(state: AppState) {
+    private func updateStatusIcon(state: AppState, progress: Double? = nil) {
         currentAppState = state
-
-        let iconName: String
-        switch state {
-        case .downloading:
-            iconName = "arrow.down.circle"
-        case .ready:
-            iconName = "waveform"
-        case .recording:
-            iconName = "waveform.circle.fill"
-        case .transcribing:
-            iconName = "ellipsis.circle"
-        case .error:
-            iconName = "exclamationmark.triangle"
-        }
+        currentProgress = state == .downloading ? progress : nil
 
         guard let button = statusItem?.button else {
             logger.error("Status item button unavailable when trying to update icon")
             return
         }
 
-        button.image = NSImage(systemSymbolName: iconName, accessibilityDescription: "Jabber")
+        // Matches the menu header, which says setup is unfinished or a
+        // permission is missing rather than that Jabber is ready.
+        let missingPermission = state == .ready ? currentMissingPermission() : nil
+        let description: String
+        switch missingPermission {
+        case .microphone:
+            description = "Jabber, microphone access needed"
+        case .accessibility:
+            description = "Jabber, accessibility access needed"
+        case nil:
+            description = state == .error && shouldShowAutomaticOnboarding()
+                ? "Jabber, finish setup to dictate"
+                : state.accessibilityDescription(progress: currentProgress)
+        }
+        if let currentProgress {
+            button.image = DownloadProgressIcon.image(progress: currentProgress, accessibilityDescription: description)
+        } else {
+            let symbolName = missingPermission == nil ? state.symbolName : AppState.error.symbolName
+            button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: description)
+        }
         button.contentTintColor = state == .recording ? .systemRed : nil
     }
 
@@ -307,7 +451,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         if let button = statusItem?.button {
-            button.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "Jabber")
+            button.image = NSImage(
+                systemSymbolName: currentAppState.symbolName,
+                accessibilityDescription: currentAppState.accessibilityDescription
+            )
         }
 
         let menu = buildMenu()
@@ -319,43 +466,156 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Disabled header reflecting the current state; refreshed in
         // menuWillOpen so it shows the live state and hotkey when opened.
-        let statusHeaderItem = NSMenuItem(title: statusMenuTitle(), action: nil, keyEquivalent: "")
+        let statusHeaderItem = NSMenuItem(title: currentStatusMenuState().header, action: nil, keyEquivalent: "")
         self.statusHeaderItem = statusHeaderItem
 
+        // Titles are placeholders; applyStatusMenuState sets the real ones.
+        let toggleItem = NSMenuItem(title: "Start Dictation", action: #selector(toggleDictationFromMenu), keyEquivalent: "")
+        dictationToggleItem = toggleItem
+        let lastItem = NSMenuItem(title: "Paste Last Transcript", action: #selector(deliverLastTranscript), keyEquivalent: "")
+        lastTranscriptItem = lastItem
+        let recentItem = NSMenuItem(title: "Recent Transcripts", action: nil, keyEquivalent: "")
+        recentItem.submenu = NSMenu()
+        recentTranscriptsItem = recentItem
+        let retryItem = NSMenuItem(title: "Retry Failed Dictation", action: #selector(retryFailedDictation), keyEquivalent: "")
+        retryFailedDictationItem = retryItem
+        let discardItem = NSMenuItem(title: "Discard Failed Recording", action: #selector(discardFailedDictation), keyEquivalent: "")
+        discardFailedDictationItem = discardItem
+        let retryLoadItem = NSMenuItem(title: "Retry Loading Model", action: #selector(retryModelLoad), keyEquivalent: "")
+        retryModelLoadItem = retryLoadItem
+        let redownloadItem = NSMenuItem(title: "Re-download Model", action: #selector(redownloadModel), keyEquivalent: "")
+        redownloadModelItem = redownloadItem
+        let fixItem = NSMenuItem(title: "Fix Permissions…", action: #selector(openSettings), keyEquivalent: "")
+        fixPermissionsItem = fixItem
+        let languageItem = NSMenuItem(title: "Language", action: nil, keyEquivalent: "")
+        languageItem.submenu = NSMenu()
+        self.languageItem = languageItem
         let openItem = NSMenuItem(title: "Open Jabber", action: #selector(openJabber), keyEquivalent: "")
         let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
         let updatesItem = NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
         let quitItem = NSMenuItem(title: "Quit Jabber", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
 
-        for item in [openItem, settingsItem, updatesItem] {
+        for item in [toggleItem, lastItem, retryItem, discardItem, retryLoadItem, redownloadItem, fixItem, openItem, settingsItem, updatesItem] {
             item.target = self
         }
         // quitItem has no target → routes through the responder chain to NSApp.terminate.
         // statusHeaderItem has no action either, so autoenablesItems keeps it disabled.
 
-        menu.items = [statusHeaderItem, .separator(), openItem, settingsItem,
-                      .separator(), updatesItem, .separator(), quitItem]
+        menu.items = [statusHeaderItem, fixItem, toggleItem, lastItem, recentItem, retryItem, discardItem, retryLoadItem,
+                      redownloadItem, .separator(), languageItem,
+                      .separator(), openItem, settingsItem, .separator(), updatesItem, .separator(), quitItem]
         menu.delegate = self
+        applyStatusMenuState(currentStatusMenuState())
+        refreshLanguageMenu()
         return menu
     }
 
-    private func statusMenuTitle() -> String {
-        switch currentAppState {
-        case .downloading:
-            return "Downloading Model…"
-        case .ready:
-            let shortcut = HotkeyShortcut(
-                keyCode: UInt32(TypedSettings[.hotkeyKeyCode]),
-                modifiers: UInt32(TypedSettings[.hotkeyModifiers])
-            )
-            return "Ready to Dictate — \(shortcut.displayString)"
-        case .recording:
-            return "Recording…"
-        case .transcribing:
-            return "Transcribing…"
-        case .error:
-            return "Model Unavailable"
+    /// Lists the recent languages, remembering the current one so a language
+    /// picked in Settings shows up too.
+    private func refreshLanguageMenu() {
+        let current = TypedSettings[.selectedLanguage]
+        let recents = LanguageMenu.recentLanguages(adding: current, to: TypedSettings[.recentLanguages])
+        TypedSettings[.recentLanguages] = LanguageMenu.encode(recents)
+
+        var items = LanguageMenu.items(recentLanguages: recents, current: current).map { item in
+            let menuItem = NSMenuItem(title: item.title, action: #selector(selectLanguage(_:)), keyEquivalent: "")
+            menuItem.target = self
+            menuItem.representedObject = item.code
+            menuItem.state = item.isSelected ? .on : .off
+            return menuItem
         }
+        let otherItem = NSMenuItem(title: "Other Language…", action: #selector(openSpeechSettings), keyEquivalent: "")
+        otherItem.target = self
+        items.append(.separator())
+        items.append(otherItem)
+        languageItem?.submenu?.items = items
+        languageItem?.subtitle = LanguageMenu.displayName(for: current)
+    }
+
+    /// Switches language, and the model too when the current one can't
+    /// transcribe it. Without a downloaded model for the language, Speech
+    /// settings opens on it so the user can download one.
+    @objc private func selectLanguage(_ sender: NSMenuItem) {
+        guard let code = sender.representedObject as? String, dictationCoordinator.isIdle else { return }
+        TypedSettings[.selectedLanguage] = code
+        TypedSettings[.recentLanguages] = LanguageMenu.encode(
+            LanguageMenu.recentLanguages(adding: code, to: TypedSettings[.recentLanguages])
+        )
+
+        let modelManager = ModelManager.shared
+        guard let modelId = LanguageMenu.modelId(
+            for: code,
+            currentModelId: modelManager.selectedModelId(),
+            downloadedModelIds: Set(modelManager.downloadedModels.map(\.id))
+        ) else {
+            openSpeechSettings()
+            return
+        }
+        // A no-op when the current model already covers the language.
+        _ = modelManager.selectModel(modelId)
+    }
+
+    @objc private func openSpeechSettings() {
+        showMainWindow(initialSection: .speech)
+        // Selects Speech when the window is already open; see openSettings.
+        NotificationCenter.default.post(
+            name: Constants.Notifications.mainWindowSectionDidRequest,
+            object: MainWindowView.Section.speech
+        )
+    }
+
+    private func currentStatusMenuState() -> StatusMenuState {
+        let hasModelLoadFailed: Bool
+        if case .error = modelState {
+            hasModelLoadFailed = !isModelLoadInProgress
+        } else {
+            hasModelLoadFailed = false
+        }
+        return StatusMenuState.resolve(
+            appState: currentAppState,
+            progress: currentProgress,
+            hotkeyDisplay: TypedSettings.hotkeyShortcut.displayString,
+            isSetupPending: shouldShowAutomaticOnboarding(),
+            dictationState: dictationCoordinator.state,
+            lastTranscript: dictationCoordinator.lastTranscript,
+            historyEntries: DictationHistoryModel.shared.entries,
+            isHistoryEnabled: TypedSettings[.historyEnabled],
+            outputMode: typingService.mode,
+            hasFailedDictation: dictationCoordinator.hasFailedDictation,
+            canStartSession: dictationCoordinator.canStart,
+            hasModelLoadFailed: hasModelLoadFailed,
+            isFailedModelDownloaded: isSelectedModelOnDisk(),
+            missingPermission: currentMissingPermission()
+        )
+    }
+
+    private func currentMissingPermission() -> StatusMenuState.MissingPermission? {
+        StatusMenuState.MissingPermission.resolve(
+            microphoneStatus: permissionService.microphoneAuthorizationStatus(),
+            isAccessibilityTrusted: permissionService.hasAccessibilityPermission(),
+            isAccessibilityNeeded: typingService.requiresAccessibilityPermission
+                || TypedSettings.hotkeyShortcut.needsAccessibility
+        )
+    }
+
+    /// Re-reads permissions into the icon, which otherwise changes only with
+    /// the model or dictation state.
+    private func refreshStatusIcon() {
+        updateStatusIcon(state: currentAppState, progress: currentProgress)
+    }
+
+    private func applyStatusMenuState(_ state: StatusMenuState) {
+        statusHeaderItem?.title = state.header
+        dictationToggleItem?.title = state.dictationItemTitle
+        lastTranscriptItem?.title = state.lastTranscriptItemTitle
+        lastTranscriptItem?.subtitle = state.lastTranscriptPreview
+        recentTranscriptsItem?.isHidden = state.recentTranscripts.isEmpty
+        recentTranscriptsItem?.submenu?.items = recentTranscriptMenuItems(state.recentTranscripts)
+        retryFailedDictationItem?.isHidden = !state.showsFailedDictationItems
+        discardFailedDictationItem?.isHidden = !state.showsFailedDictationItems
+        retryModelLoadItem?.isHidden = !state.showsRetryModelLoad
+        redownloadModelItem?.isHidden = !state.showsRedownloadModel
+        fixPermissionsItem?.isHidden = !state.showsFixPermissions
     }
 
     @objc private func openJabber() {
@@ -373,8 +633,93 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
+    /// One item per recent transcript, with when and where it was dictated
+    /// underneath, then a way to the full list.
+    private func recentTranscriptMenuItems(_ transcripts: [StatusMenuState.RecentTranscript]) -> [NSMenuItem] {
+        var items = transcripts.map { transcript in
+            let item = NSMenuItem(title: transcript.title, action: #selector(deliverRecentTranscript(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = transcript.text
+            let time = transcript.timestamp.formatted(date: .abbreviated, time: .shortened)
+            item.subtitle = transcript.appName.map { "\(time) · \($0)" } ?? time
+            return item
+        }
+        let showAllItem = NSMenuItem(title: "Show All History…", action: #selector(openHistory), keyEquivalent: "")
+        showAllItem.target = self
+        items.append(.separator())
+        items.append(showAllItem)
+        return items
+    }
+
+    @objc private func openHistory() {
+        showMainWindow(initialSection: .history)
+        // Selects History when the window is already open; see openSettings.
+        NotificationCenter.default.post(
+            name: Constants.Notifications.mainWindowSectionDidRequest,
+            object: MainWindowView.Section.history
+        )
+    }
+
     @objc private func checkForUpdates() {
         updaterController.checkForUpdates()
+    }
+
+    /// Re-transcribes the kept failed dictation into whatever app is focused
+    /// now. Runs the hotkey path's readiness checks, minus the microphone:
+    /// nothing is recorded.
+    @objc private func retryFailedDictation() {
+        guard transcriptionService.isReady else {
+            showModelUnavailableNotice()
+            return
+        }
+
+        guard dictationCoordinator.canStart else {
+            showTranscriptionBusyNotice()
+            return
+        }
+
+        guard ensureOutputPermissionReady() else { return }
+
+        let targetProcessID = TypingService.captureFocusedProcessID()
+        currentTargetProcessID = targetProcessID
+        _ = dictationCoordinator.retryFailedDictation(targetProcessID: targetProcessID)
+    }
+
+    @objc private func discardFailedDictation() {
+        dictationCoordinator.discardFailedDictation()
+    }
+
+    /// Start, stop, or cancel from the status menu, matching what the item
+    /// said when the menu opened.
+    @objc private func toggleDictationFromMenu() {
+        switch dictationCoordinator.state {
+        case .idle:
+            Task { @MainActor [weak self] in
+                await self?.startDictation(pressID: nil)
+            }
+        case .recording:
+            dictationCoordinator.stop()
+        case .transcribing:
+            cancelDictationFromUser()
+        }
+    }
+
+    /// Delivers the last transcript again, through the current output mode,
+    /// into whatever app is focused now.
+    @objc private func deliverLastTranscript() {
+        guard let text = dictationCoordinator.lastTranscript else { return }
+        deliverTranscript(text)
+    }
+
+    /// Delivers a saved transcript chosen under Recent Transcripts.
+    @objc private func deliverRecentTranscript(_ sender: NSMenuItem) {
+        guard let text = sender.representedObject as? String else { return }
+        deliverTranscript(text)
+    }
+
+    private func deliverTranscript(_ text: String) {
+        guard dictationCoordinator.isIdle, ensureOutputPermissionReady() else { return }
+        typingService.output(text, targetProcessID: TypingService.captureFocusedProcessID())
     }
 
     private func setupHotkey() {
@@ -386,9 +731,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.handleHotkeyUpEvent()
         }
 
+        hotkeyManager.onDiscard = { [weak self] in
+            self?.discardDictationFromHotkeyCombo()
+        }
+
+        hotkeyManager.onCancelKey = { [weak self] in
+            self?.cancelDictationFromUser()
+        }
+
         hotkeyManager.onRegistrationFailure = { [weak self] status in
-            self?.logger.error("Hotkey registration failed with status: \(status)")
+            guard let self else { return }
+            self.logger.error("Hotkey registration failed with status: \(status)")
             let shortcut = TypedSettings.hotkeyShortcut
+            let shouldNotify = self.hotkeyRetryPolicy.recordFailure(
+                isModifierOnly: shortcut.isModifierOnly,
+                isTrusted: self.permissionService.refreshAccessibilityPermissionStatus()
+            )
+            self.updateHotkeyRetryPolling()
+            guard shouldNotify else { return }
+
             let display = shortcut.displayString
             let message: String
             if shortcut.isModifierOnly {
@@ -406,9 +767,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         registerConfiguredHotkey()
     }
 
+    /// Routes NotificationService's on-screen notices (feedback, and messages
+    /// it cannot post as notifications) to the recording overlay.
+    private func setupOverlayNotices() {
+        NotificationService.shared.noticePresenter = { [weak self] title, message in
+            self?.showOverlayNotice(title: title, message: message)
+        }
+        overlayWindow.onFallbackNoticeCleared = { [weak self] in
+            self?.syncNonDictationUI()
+        }
+        downloadOverlay.onDismiss = { [weak self] in
+            self?.isDownloadOverlayDismissed = true
+            self?.downloadOverlay.hide()
+        }
+    }
+
+    private func showOverlayNotice(title: String, message: String) {
+        overlayWindow.showFallbackNotice(title: title, message: message)
+        // The notice takes the download overlay's spot until it clears; see
+        // showDownloadOverlay.
+        downloadOverlay.hide()
+    }
+
     private func setupDictationCoordinator() {
         dictationCoordinator.onStateChange = { [weak self] state in
             self?.handleDictationStateChange(state)
+        }
+
+        overlayWindow.onCancel = { [weak self] in
+            self?.cancelDictationFromUser()
         }
 
         dictationCoordinator.onAudioLevel = { [weak self] level in
@@ -430,10 +817,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         dictationCoordinator.onTranscriptionError = { [weak self] error in
             guard let self else { return }
-            self.logger.error("Transcription failed: \(error.localizedDescription)")
+            self.logger.error("Transcription failed: \(error.localizedDescription, privacy: .public)")
             NotificationService.shared.showError(
                 title: "Transcription Failed",
-                message: "Could not transcribe audio: \(error.localizedDescription)",
+                message: "Jabber kept the recording. Choose Retry Failed Dictation from the menu bar icon to try again. Error: \(error.localizedDescription)",
                 critical: false
             )
         }
@@ -444,14 +831,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         dictationCoordinator.onPostProcessingError = { [weak self] error in
             guard let self else { return }
-            self.logger.error("Post-processing failed: \(error.localizedDescription)")
+            self.logger.error("Post-processing failed: \(error.localizedDescription, privacy: .public)")
             self.showPostProcessingFailureNotice(error)
         }
 
         dictationCoordinator.onPostProcessingFallback = { [weak self] in
             guard let self else { return }
             self.logger.notice("Post-processing fell back to raw transcript after guardrail rejection")
-            self.overlayWindow.showFallbackNotice("Post-processing looked wrong — used raw transcript")
+            self.overlayWindow.showFallbackNotice(
+                title: "Used Raw Transcript",
+                message: "Post-processing looked wrong."
+            )
         }
 
         dictationCoordinator.onRecordingLimitReached = { [weak self] in
@@ -491,6 +881,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func handleHotkeyCaptureBegin() {
+        stopHotkeyRetry()
         hotkeyManager.unregister()
     }
 
@@ -498,8 +889,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         registerConfiguredHotkey()
     }
 
+    @objc private func handleApplicationDidBecomeActive() {
+        retryHotkeyRegistrationIfTrusted()
+        refreshStatusIcon()
+    }
+
     private func registerConfiguredHotkey() {
+        stopHotkeyRetry()
         hotkeyManager.register(TypedSettings.hotkeyShortcut)
+    }
+
+    private func stopHotkeyRetry() {
+        hotkeyRetryPolicy.reset()
+        updateHotkeyRetryPolling()
+    }
+
+    private func updateHotkeyRetryPolling() {
+        guard hotkeyRetryPolicy.isPending else {
+            hotkeyRetryTask?.cancel()
+            hotkeyRetryTask = nil
+            return
+        }
+        guard hotkeyRetryTask == nil else { return }
+
+        hotkeyRetryTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: ModifierOnlyRegistrationRetryPolicy.pollInterval)
+                } catch is CancellationError {
+                    return
+                } catch {
+                    self?.logger.error("Hotkey retry polling failed: \(error.localizedDescription, privacy: .public)")
+                    return
+                }
+
+                guard let self else { return }
+                self.retryHotkeyRegistrationIfTrusted()
+            }
+        }
+    }
+
+    private func retryHotkeyRegistrationIfTrusted() {
+        guard hotkeyRetryPolicy.isPending else { return }
+        let isTrusted = permissionService.refreshAccessibilityPermissionStatus()
+        guard hotkeyRetryPolicy.recordTrust(isTrusted) else { return }
+
+        logger.info("Accessibility granted; re-registering modifier-only hotkey")
+        // On failure the manager reports through onRegistrationFailure, which
+        // keeps the retry pending without notifying again.
+        guard hotkeyManager.register(TypedSettings.hotkeyShortcut) == noErr else { return }
+
+        logger.notice("Re-registered modifier-only hotkey after Accessibility was granted")
+        stopHotkeyRetry()
     }
 
     private var hasActiveOrPendingRecording: Bool {
@@ -514,7 +955,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         switch mode {
         case .hold:
-            startDictationFromHotkey()
+            startDictationFromHotkey(isProvisional: true)
         case .toggle:
             if hasActiveOrPendingRecording {
                 stopOrAbortDictationFromHotkey()
@@ -539,7 +980,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         switch mode {
         case .hold:
-            stopOrAbortDictationFromHotkey()
+            if dictationCoordinator.isRecording, dictationCoordinator.isProvisional {
+                logger.notice("Dropped a hotkey tap shorter than the hold threshold")
+                dictationCoordinator.cancel()
+            } else {
+                stopOrAbortDictationFromHotkey()
+            }
         case .toggle:
             break
         case .automatic:
@@ -560,37 +1006,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func startDictationFromHotkey() {
+    private func startDictationFromHotkey(isProvisional: Bool = false) {
         currentHotkeyPressID += 1
         let pressID = currentHotkeyPressID
         pendingHotkeyStartID = pressID
 
         Task { @MainActor [weak self] in
-            await self?.finishStartDictationFromHotkey(pressID: pressID)
+            await self?.startDictation(pressID: pressID, isProvisional: isProvisional)
         }
     }
 
-    private func finishStartDictationFromHotkey(pressID: Int) async {
+    /// Runs the readiness checks and starts recording into the focused app.
+    /// `pressID` identifies a hotkey press, whose release may abort the start
+    /// while microphone permission is pending; menu starts pass nil. A
+    /// provisional start stays invisible until it outlasts a tap.
+    private func startDictation(pressID: Int?, isProvisional: Bool = false) async {
         defer {
-            if pendingHotkeyStartID == pressID {
-                pendingHotkeyStartID = nil
+            if let pressID {
+                if pendingHotkeyStartID == pressID {
+                    pendingHotkeyStartID = nil
+                }
+                abortedHotkeyPressIDs.remove(pressID)
             }
-            abortedHotkeyPressIDs.remove(pressID)
         }
 
         guard transcriptionService.isReady else {
-            let now = CFAbsoluteTimeGetCurrent()
-            if now - lastModelUnavailableNotice > 1.5 {
-                lastModelUnavailableNotice = now
-                let declinedDownload = hasDeclinedModelMigrationDownloadPending()
-                NotificationService.shared.showWarning(
-                    title: declinedDownload ? "Model Not Downloaded" : "Model Not Ready",
-                    message: declinedDownload
-                        ? "Your selected speech model isn't downloaded. Open Speech settings to download it or choose another model."
-                        : "Jabber is still preparing the speech model. Try again in a moment."
-                )
-                showSetupGuidanceIfNeeded(preferSpeechSettings: declinedDownload)
-            }
+            showModelUnavailableNotice()
             return
         }
 
@@ -601,10 +1042,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let hasMicrophonePermission = await permissionService.requestMicrophonePermission()
         guard hasMicrophonePermission else {
-            NotificationService.shared.showPermissionWarning(
+            NotificationService.shared.showFeedback(
                 title: "Microphone Permission Required",
-                message: "Jabber needs microphone access to record speech.",
-                section: .microphone
+                message: "Jabber needs microphone access to record speech."
             )
             showSetupGuidanceIfNeeded()
             return
@@ -612,13 +1052,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // If the key was released while we were awaiting permission, treat this
         // press as aborted rather than starting a recording after release.
-        if abortedHotkeyPressIDs.remove(pressID) != nil {
+        if let pressID, abortedHotkeyPressIDs.remove(pressID) != nil {
             return
         }
 
         guard ensureOutputPermissionReady() else { return }
 
-        if dictationCoordinator.isRecording { return }
+        if dictationCoordinator.isRecording {
+            return
+        }
 
         guard dictationCoordinator.canStart else {
             showTranscriptionBusyNotice()
@@ -627,12 +1069,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let targetProcessID = TypingService.captureFocusedProcessID()
         currentTargetProcessID = targetProcessID
-        _ = dictationCoordinator.start(targetProcessID: targetProcessID)
+        _ = dictationCoordinator.start(targetProcessID: targetProcessID, isProvisional: isProvisional)
+    }
+
+    /// Escape or the overlay's cancel button: drop the session in progress,
+    /// recording or transcribing, without delivering anything. A cancelled
+    /// retry keeps its failed recording for another try.
+    private func cancelDictationFromUser() {
+        guard !dictationCoordinator.isIdle else { return }
+        logger.notice("Dictation cancelled by the user")
+        dictationCoordinator.cancel()
+    }
+
+    /// Another key joined the held lone-modifier shortcut: the user was
+    /// typing a combo, so a recording this press started is dropped. A
+    /// recording latched hands-free by an earlier press keeps going.
+    private func discardDictationFromHotkeyCombo() {
+        let startedByThisPress: Bool
+        switch activeHotkeyPressMode {
+        case .hold:
+            startedByThisPress = true
+        case .automatic:
+            startedByThisPress = automaticHotkeyPressStartedRecording
+            automaticHotkeyPressStartedRecording = false
+        case .toggle, nil:
+            startedByThisPress = false
+        }
+        guard startedByThisPress else { return }
+
+        if dictationCoordinator.isRecording {
+            logger.notice("Discarded a dictation: another key joined the held shortcut")
+            dictationCoordinator.cancel()
+        } else if let pendingID = pendingHotkeyStartID {
+            abortedHotkeyPressIDs.insert(pendingID)
+        }
     }
 
     private func stopOrAbortDictationFromHotkey() {
         if dictationCoordinator.isRecording {
-            dictationCoordinator.stop()
+            dictationCoordinator.stop(tail: Self.hotkeyReleaseTail)
         } else if let pendingID = pendingHotkeyStartID {
             // Release arrived before recording began (e.g. during the permission
             // await). Mark the in-flight press aborted so it does not start
@@ -648,18 +1123,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func ensureOutputPermissionReady() -> Bool {
-        guard typingService.requiresAccessibilityPermission else { return true }
-        guard !permissionService.hasAccessibilityPermission() else { return true }
+        guard typingService.requiresAccessibilityPermission, !permissionService.hasAccessibilityPermission() else { return true }
 
         showAccessibilityPermissionWarning()
         return false
     }
 
     private func showAccessibilityPermissionWarning() {
-        NotificationService.shared.showPermissionWarning(
+        NotificationService.shared.showFeedback(
             title: "Accessibility Permission Required",
-            message: "Grant accessibility permission before dictating into the active app, or switch output to Copy to clipboard in Settings.",
-            section: .accessibility
+            message: "Grant accessibility permission before dictating into the active app, or switch output to Copy to clipboard in Settings."
         )
         showSetupGuidanceIfNeeded()
 
@@ -675,7 +1148,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } catch is CancellationError {
                 return
             } catch {
-                self?.logger.error("Failed while waiting to show first-run setup: \(error.localizedDescription)")
+                self?.logger.error("Failed while waiting to show first-run setup: \(error.localizedDescription, privacy: .public)")
                 return
             }
 
@@ -694,8 +1167,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func shouldShowAutomaticOnboarding() -> Bool {
-        guard !TypedSettings[.onboardingCompleted] else { return false }
-        guard !TypedSettings[.didShowFirstRunSetup] else { return false }
+        guard !TypedSettings[.onboardingCompleted], !TypedSettings[.didShowFirstRunSetup] else { return false }
         return true
     }
 
@@ -716,6 +1188,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let coordinator = OnboardingCoordinator()
         let rootView = OnboardingView(
             coordinator: coordinator,
+            onReachReady: { [weak self] in
+                self?.startOnboardingModelLoadIfNeeded()
+            },
             onComplete: { [weak self] in
                 self?.completeOnboarding()
             },
@@ -753,10 +1228,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         onboardingCompletedBeforeUserInitiatedRun = false
         // windowWillClose refreshes the activation policy.
         onboardingWindow?.close()
-        // Now that onboarding has settled the user's model choice, kick off
-        // the load. It was intentionally skipped at launch (see
-        // applicationDidFinishLaunching) so the default model wouldn't
-        // auto-download during onboarding.
+        startOnboardingModelLoadIfNeeded()
+    }
+
+    /// Loads the model onboarding settled on. The launch path skips the load
+    /// while onboarding is pending (see applicationDidFinishLaunching) so the
+    /// default model can't auto-download. Every arrival at the Ready step
+    /// calls this so its "Try it" field works, and completion calls it again
+    /// in case that load failed. A load already in flight is left alone:
+    /// restarting it would throw away a partly loaded model. No `isReady`
+    /// guard: re-running onboarding can change the selection without a
+    /// modelDidChange, and ensureModelLoaded is a no-op when the right model
+    /// is already loaded.
+    private func startOnboardingModelLoadIfNeeded() {
+        guard !isModelLoadInProgress else { return }
         startModelLoadingTask()
     }
 
@@ -775,8 +1260,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func pendingModelMigrationNotice() -> ModelMigrationNotice? {
         // Onboarding owns the new-user / pre-onboarding upgrade flow; don't
         // compete with it.
-        guard !shouldShowAutomaticOnboarding() else { return nil }
-        guard let migration = ModelManager.shared.lastMigration else { return nil }
+        guard !shouldShowAutomaticOnboarding(), let migration = ModelManager.shared.lastMigration else { return nil }
 
         return ModelMigrationNoticeResolver.resolve(
             migration: migration,
@@ -826,7 +1310,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } catch is CancellationError {
                 return
             } catch {
-                self?.logger.error("Failed while waiting to present model migration: \(error.localizedDescription)")
+                self?.logger.error("Failed while waiting to present model migration: \(error.localizedDescription, privacy: .public)")
                 return
             }
             self?.presentModelMigrationNotice(notice)
@@ -990,8 +1474,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Only auto-load when the selected model is already installed —
         // loading would otherwise kick off the multi-GB download the launch
         // path deliberately avoids for a user who abandoned onboarding.
-        guard ModelManager.shared.isSelectedModelDownloaded else { return }
-        guard !isModelLoadInProgress, !transcriptionService.isReady else { return }
+        guard ModelManager.shared.isSelectedModelDownloaded, !isModelLoadInProgress, !transcriptionService.isReady else { return }
 
         if !startDeclinedModelMigrationFallbackIfNeeded() {
             startModelLoadingTask()
@@ -999,46 +1482,113 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handleDictationStateChange(_ state: DictationCoordinator.State) {
+        // Escape cancels only while there is a session to cancel.
+        if state == .idle {
+            hotkeyManager.unregisterCancelKey()
+        } else {
+            hotkeyManager.registerCancelKey()
+        }
+
         switch state {
         case .idle:
+            provisionalConfirmTask?.cancel()
+            provisionalConfirmTask = nil
+            isRecordingUIShown = false
             overlayWindow.hide()
             overlayWindow.setTargetAppIcon(nil)
             currentTargetProcessID = nil
             syncNonDictationUI()
+            // A "Download & Use" that finished mid-session switches now.
+            ModelManager.shared.applyPendingSelection()
         case .recording:
-            downloadOverlay.hide()
-            overlayWindow.show()
-            overlayWindow.setTargetAppIcon(
-                TypingService.appIcon(forTargetProcessID: currentTargetProcessID)
-            )
-            updateStatusIcon(state: .recording)
-            SoundFeedbackService.shared.play(.dictationStart)
+            if dictationCoordinator.isProvisional {
+                scheduleProvisionalConfirm()
+            } else {
+                showRecordingUI()
+            }
         case .transcribing:
+            if isRecordingUIShown {
+                SoundFeedbackService.shared.play(.dictationStop)
+            } else {
+                // A retry skips recording, and a provisional recording can
+                // stop before it was confirmed, so the overlay is not up yet
+                // and there is no started recording to cue.
+                downloadOverlay.hide()
+                overlayWindow.show()
+                overlayWindow.setTargetAppIcon(
+                    TypingService.appIcon(forTargetProcessID: currentTargetProcessID)
+                )
+            }
             overlayWindow.showProcessing()
             updateStatusIcon(state: .transcribing)
-            SoundFeedbackService.shared.play(.dictationStop)
+        }
+    }
+
+    private func showRecordingUI() {
+        isRecordingUIShown = true
+        downloadOverlay.hide()
+        overlayWindow.show()
+        overlayWindow.setTargetAppIcon(
+            TypingService.appIcon(forTargetProcessID: currentTargetProcessID)
+        )
+        overlayWindow.setInputDeviceName(currentInputDeviceName())
+        overlayWindow.startRecordingClock(
+            limit: TimeInterval(dictationCoordinator.maxRecordingDuration.components.seconds)
+        )
+        updateStatusIcon(state: .recording)
+        SoundFeedbackService.shared.play(.dictationStart)
+    }
+
+    /// The microphone dictation records from: the selected one, or the macOS
+    /// default.
+    private func currentInputDeviceName() -> String? {
+        let monitor = AudioInputDeviceMonitor.shared
+        let selectedUID = TypedSettings[.inputDeviceUID]
+        guard !selectedUID.isEmpty else { return monitor.defaultInputDevice?.name }
+        return monitor.devices.first { $0.uid == selectedUID }?.name
+    }
+
+    /// Shows the recording once a provisional Hold press outlasts a tap. A
+    /// lone-modifier press already waited out its debounce before starting,
+    /// so it only waits for the rest of the threshold.
+    private func scheduleProvisionalConfirm() {
+        let delay = TypedSettings.hotkeyShortcut.isModifierOnly
+            ? Self.holdTapThreshold - .milliseconds(Int(ModifierOnlyGestureReducer.debounceInterval * 1_000))
+            : Self.holdTapThreshold
+        provisionalConfirmTask?.cancel()
+        provisionalConfirmTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: delay)
+            } catch is CancellationError {
+                return
+            } catch {
+                self?.logger.error("Provisional recording confirm sleep failed: \(error.localizedDescription, privacy: .public)")
+            }
+            guard let self, dictationCoordinator.isRecording, dictationCoordinator.isProvisional else { return }
+            provisionalConfirmTask = nil
+            dictationCoordinator.confirmRecording()
+            showRecordingUI()
         }
     }
 
     private func showNoSpeechDetectedWarning() {
-        NotificationService.shared.showWarning(
+        NotificationService.shared.showFeedback(
             title: "No Speech Detected",
             message: "Could not detect any speech in the recording. Try speaking louder or closer to the microphone."
         )
     }
 
     private func showAudioCaptureError(_ error: Error) {
-        logger.error("Audio capture error: \(error.localizedDescription)")
+        logger.error("Audio capture error: \(error.localizedDescription, privacy: .public)")
 
         if let captureError = error as? AudioCaptureError {
             switch captureError {
             case .inputUnavailable, .deviceChangeRecoveryFailed,
                  .selectedInputUnavailable, .inputDeviceSelectionUnavailable,
                  .couldNotSelectInput:
-                NotificationService.shared.showError(
+                NotificationService.shared.showFeedback(
                     title: "Microphone Unavailable",
-                    message: error.localizedDescription,
-                    critical: false
+                    message: error.localizedDescription
                 )
                 return
             case .invalidFormat, .converterUnavailable, .conversionFailed:
@@ -1046,25 +1596,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        NotificationService.shared.showError(
+        NotificationService.shared.showFeedback(
             title: "Audio Processing Error",
-            message: "Failed to process audio: \(error.localizedDescription)",
-            critical: false
+            message: "Failed to process audio: \(error.localizedDescription)"
         )
+    }
+
+    private func showModelUnavailableNotice() {
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastModelUnavailableNotice > 1.5 else { return }
+        lastModelUnavailableNotice = now
+        let declinedDownload = hasDeclinedModelMigrationDownloadPending()
+        NotificationService.shared.showFeedback(
+            title: declinedDownload ? "Model Not Downloaded" : "Model Not Ready",
+            message: declinedDownload
+                ? "Your selected speech model isn't downloaded. Open Speech settings to download it or choose another model."
+                : "Jabber is still preparing the speech model. Try again in a moment."
+        )
+        showSetupGuidanceIfNeeded(preferSpeechSettings: declinedDownload)
     }
 
     private func showTranscriptionBusyNotice() {
         let now = CFAbsoluteTimeGetCurrent()
         guard now - lastTranscriptionBusyNotice > 1.5 else { return }
         lastTranscriptionBusyNotice = now
-        NotificationService.shared.showWarning(
+        NotificationService.shared.showFeedback(
             title: "Still Transcribing",
             message: "Jabber is finishing the previous dictation. Try again in a moment."
         )
     }
 
     /// Non-blocking notice that transcript refinement failed and the raw
-    /// transcript was typed instead. Rate-limited so a flaky provider does not
+    /// transcript was delivered instead. Rate-limited so a flaky provider does not
     /// spam a notification on every dictation. Only true provider failures
     /// reach this path; guardrail rejections are surfaced non-disruptively via
     /// `overlayWindow.showFallbackNotice` instead. The message names the
@@ -1075,11 +1638,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard now - lastPostProcessingFailureNotice > 1.5 else { return }
         lastPostProcessingFailureNotice = now
 
-        let providerName = TypedSettings.postProcessingProviderKind.displayName
-        NotificationService.shared.showWarning(
+        NotificationService.shared.showFeedback(
             title: "Couldn't Refine Transcript",
-            message: "\(providerName) cleanup failed (\(error.localizedDescription)). Typed the raw transcript instead."
+            message: Self.postProcessingFailureMessage(
+                providerName: TypedSettings.postProcessingProviderKind.displayName,
+                errorDescription: error.localizedDescription,
+                outputMode: typingService.mode
+            )
         )
+    }
+
+    /// Names where the raw transcript went, so clipboard users aren't told it
+    /// was typed.
+    static func postProcessingFailureMessage(
+        providerName: String,
+        errorDescription: String,
+        outputMode: TypingService.OutputMode
+    ) -> String {
+        let delivery: String
+        switch outputMode {
+        case .clipboard:
+            delivery = "Copied the raw transcript to the clipboard instead."
+        case .directTyping:
+            delivery = "Typed the raw transcript instead."
+        }
+        return "\(providerName) cleanup failed (\(errorDescription)). \(delivery)"
     }
 
     @objc private func handleModelDownloadState(_ notification: Notification) {
@@ -1123,6 +1706,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         syncNonDictationUI(forceLoading: isSelectedModelFinished)
+
+        // "Download & Use": switch now unless a dictation is running; then it
+        // waits for the session to end (handleDictationStateChange) instead
+        // of being cancelled by the model change.
+        if state.phase == .finished, dictationCoordinator.isIdle {
+            ModelManager.shared.applyPendingSelection()
+        }
     }
 
     private func updateDownloadTracking(with state: ModelDownloadState) {
@@ -1181,24 +1771,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func applyNonDictationUI(_ state: NonDictationUIState) {
         switch state {
         case .ready:
+            isDownloadOverlayDismissed = false
             downloadOverlay.hide()
             updateStatusIcon(state: .ready)
         case .downloading(let download):
-            downloadOverlay.show()
+            showDownloadOverlay()
             downloadOverlay.updateProgress(download.progress, status: download.status)
-            updateStatusIcon(state: .downloading)
+            updateStatusIcon(state: .downloading, progress: download.progress)
         case .loadingModel(let status, let progress):
-            downloadOverlay.show()
+            showDownloadOverlay()
             if let progress {
                 downloadOverlay.updateProgress(progress, status: status)
             } else {
                 downloadOverlay.updateProgress(0, status: status, indeterminate: true)
             }
-            updateStatusIcon(state: .downloading)
+            updateStatusIcon(state: .downloading, progress: progress)
         case .error:
+            isDownloadOverlayDismissed = false
             downloadOverlay.hide()
             updateStatusIcon(state: .error)
         }
+    }
+
+    /// The download overlay shares the recording overlay's spot, so it stays
+    /// hidden while an overlay notice is up. The notice's cleared callback
+    /// re-syncs (setupOverlayNotices). Once hidden by the user it stays hidden
+    /// until the download or load ends.
+    private func showDownloadOverlay() {
+        guard !isDownloadOverlayDismissed, !overlayWindow.hasActiveFallbackNotice else {
+            downloadOverlay.hide()
+            return
+        }
+        downloadOverlay.show()
     }
 }
 
@@ -1216,6 +1820,10 @@ extension AppDelegate: NSWindowDelegate {
             if abandoned {
                 handleAbandonedOnboarding(previouslyCompleted: previouslyCompleted)
             }
+            // Onboarding is out of the way, finished or abandoned, so the
+            // notification prompt no longer competes with it. After a rerun
+            // the user already answered and nothing is shown.
+            NotificationService.shared.requestAuthorization()
         } else if window === modelMigrationNoticeWindow {
             if !modelMigrationNoticeHandled,
                let notice = presentedModelMigrationNotice {
@@ -1236,7 +1844,9 @@ extension AppDelegate: NSWindowDelegate {
 
 extension AppDelegate: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
-        statusHeaderItem?.title = statusMenuTitle()
+        refreshStatusIcon()
+        applyStatusMenuState(currentStatusMenuState())
+        refreshLanguageMenu()
     }
 }
 
@@ -1249,6 +1859,19 @@ extension AppDelegate: NSMenuItemValidation {
         // landmine of `menu.item(withTitle:)`.
         if item.action == #selector(checkForUpdates) {
             return updaterController.canCheckForUpdates
+        }
+        if item.action == #selector(retryFailedDictation) || item.action == #selector(discardFailedDictation) {
+            return currentStatusMenuState().canActOnFailedDictation
+        }
+        if item.action == #selector(deliverLastTranscript) {
+            return currentStatusMenuState().canDeliverLastTranscript
+        }
+        if item.action == #selector(deliverRecentTranscript(_:)) {
+            return currentStatusMenuState().canDeliverRecentTranscripts
+        }
+        if item.action == #selector(selectLanguage(_:)) {
+            // Switching mid-session would change the model under it.
+            return dictationCoordinator.isIdle
         }
         return true
     }

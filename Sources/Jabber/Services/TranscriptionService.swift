@@ -99,8 +99,8 @@ actor TranscriptionService {
             switch def.family {
             case .parakeetTDT:
                 return ParakeetASRProvider(modelId: modelId)
-            case .nemotronASR:
-                return NemotronASRProvider(modelId: modelId, huggingFaceModelId: def.huggingFaceModelId)
+            case .parakeetUnified:
+                return UnifiedASRProvider(modelId: modelId)
             case .appleSpeech:
                 return AppleSpeechProvider(modelId: modelId)
             }
@@ -163,13 +163,13 @@ actor TranscriptionService {
         let resolved = Self.resolveLanguage(language)
         selectedLanguage = resolved
         if resolved != language {
-            logger.warning("Invalid language code '\(language)' - falling back to auto-detect")
+            logger.warning("Invalid language code '\(language, privacy: .public)' - falling back to auto-detect")
 
             Task { @MainActor in
                 TypedSettings[.selectedLanguage] = "auto"
                 NotificationService.shared.showWarning(
                     title: "Invalid Language Setting",
-                    message: "The language code '\(language)' is not recognized. Auto-detect has been enabled instead."
+                    message: "The language code '\(language)' is not recognized. The language has been set to Automatic instead."
                 )
             }
         }
@@ -253,7 +253,7 @@ actor TranscriptionService {
             }
         } catch is CancellationError {
         } catch {
-            logger.error("Streaming transcription reset failed: \(error.localizedDescription)")
+            logger.error("Streaming transcription reset failed: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -329,7 +329,7 @@ actor TranscriptionService {
             } catch let error as ModelError {
                 switch error {
                 case .modelNotFound:
-                    logger.warning("Unknown model id '\(modelIdToLoad)', falling back to base")
+                    logger.warning("Unknown model id '\(modelIdToLoad, privacy: .public)', falling back to base")
                     let fallbackModelId = LanguageModelCatalog.recommendedModelId(for: Constants.defaultLanguage)
                     await loadDependencies.setSelectedModelId(fallbackModelId)
                     modelIdToLoad = fallbackModelId
@@ -416,7 +416,7 @@ actor TranscriptionService {
             }
         } catch is CancellationError {
         } catch {
-            logger.error("Provider unload failed: \(error.localizedDescription)")
+            logger.error("Provider unload failed: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -464,6 +464,8 @@ enum TranscriptionError: Error, LocalizedError {
     case loadTimeout
     case transcriptionFailed
     case modelNotReady
+    /// Apple Speech has no model for this locale on this Mac.
+    case unsupportedLanguage(Locale)
 
     var errorDescription: String? {
         switch self {
@@ -475,6 +477,9 @@ enum TranscriptionError: Error, LocalizedError {
             return "Transcription failed"
         case .modelNotReady:
             return "Transcription model is not ready"
+        case let .unsupportedLanguage(locale):
+            let name = Locale.current.localizedString(forIdentifier: locale.identifier) ?? locale.identifier
+            return "Apple Speech can't transcribe \(name) on this Mac"
         }
     }
 }

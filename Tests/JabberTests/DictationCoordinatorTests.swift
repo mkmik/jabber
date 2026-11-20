@@ -11,6 +11,7 @@ final class DictationCoordinatorTests: XCTestCase {
     private var postProcessor: FakePostProcessingProvider!
     private var postProcessingEnabled = false
     private var replacementEntries: [ReplacementEntry] = []
+    private var dictatedApps: [pid_t: DictatedApp] = [:]
     private var coordinator: DictationCoordinator!
 
     override func setUp() async throws {
@@ -23,6 +24,7 @@ final class DictationCoordinatorTests: XCTestCase {
         postProcessor = FakePostProcessingProvider()
         postProcessingEnabled = false
         replacementEntries = []
+        dictatedApps = [:]
         coordinator = DictationCoordinator(
             audioCapture: audioCapture,
             transcriptionService: transcriptionService,
@@ -33,7 +35,8 @@ final class DictationCoordinatorTests: XCTestCase {
             streamingPreviewInterval: .milliseconds(10),
             minimumStreamingPreviewSampleCount: 16_000,
             isPostProcessingEnabled: { [weak self] in self?.postProcessingEnabled ?? false },
-            replacementEntriesProvider: { [weak self] in self?.replacementEntries ?? [] }
+            replacementEntriesProvider: { [weak self] in self?.replacementEntries ?? [] },
+            dictatedAppResolver: { [weak self] processID in self?.dictatedApps[processID] }
         )
     }
 
@@ -72,11 +75,87 @@ final class DictationCoordinatorTests: XCTestCase {
         XCTAssertTrue(audioCapture.didStart)
     }
 
+    func testSessionPreventsIdleSleepUntilItEnds() async {
+        audioCapture.storedSamples = makeLoudSamples()
+        transcriptionService.transcribeResult = .success("hello")
+        let idleExpectation = XCTestExpectation(description: "coordinator returns to idle")
+        coordinator.onStateChange = { state in
+            if state == .idle {
+                idleExpectation.fulfill()
+            }
+        }
+        XCTAssertFalse(coordinator.isPreventingIdleSleep)
+
+        XCTAssertTrue(coordinator.start())
+        XCTAssertTrue(coordinator.isPreventingIdleSleep)
+        coordinator.stop()
+        XCTAssertTrue(coordinator.isTranscribing)
+        XCTAssertTrue(coordinator.isPreventingIdleSleep)
+
+        await fulfillment(of: [idleExpectation], timeout: 2)
+        XCTAssertFalse(coordinator.isPreventingIdleSleep)
+    }
+
+    func testCancelReleasesIdleSleepPrevention() {
+        XCTAssertTrue(coordinator.start())
+        coordinator.cancel()
+
+        XCTAssertFalse(coordinator.isPreventingIdleSleep)
+    }
+
     func testStartRequestsMediaPause() {
         XCTAssertTrue(coordinator.start())
 
         XCTAssertEqual(mediaPlaybackService.pauseCallCount, 1)
         XCTAssertEqual(mediaPlaybackService.resumeCallCount, 0)
+    }
+
+    func testProvisionalStartRecordsWithoutPausingMedia() {
+        XCTAssertTrue(coordinator.start(isProvisional: true))
+
+        XCTAssertTrue(coordinator.isRecording)
+        XCTAssertTrue(coordinator.isProvisional)
+        XCTAssertTrue(audioCapture.didStart)
+        XCTAssertEqual(mediaPlaybackService.pauseCallCount, 0)
+    }
+
+    func testConfirmRecordingPausesMediaOnce() {
+        XCTAssertTrue(coordinator.start(isProvisional: true))
+        coordinator.confirmRecording()
+        coordinator.confirmRecording()
+
+        XCTAssertFalse(coordinator.isProvisional)
+        XCTAssertTrue(coordinator.isRecording)
+        XCTAssertEqual(mediaPlaybackService.pauseCallCount, 1)
+    }
+
+    func testCancellingAProvisionalRecordingLeavesMediaAlone() {
+        XCTAssertTrue(coordinator.start(isProvisional: true))
+        coordinator.cancel()
+
+        XCTAssertTrue(coordinator.isIdle)
+        XCTAssertFalse(coordinator.isProvisional)
+        XCTAssertEqual(mediaPlaybackService.pauseCallCount, 0)
+        XCTAssertEqual(mediaPlaybackService.resumeCallCount, 0)
+    }
+
+    func testStoppingAProvisionalRecordingTranscribesWithoutPausingMedia() async {
+        audioCapture.storedSamples = makeLoudSamples()
+        transcriptionService.transcribeResult = .success("hello")
+        let idleExpectation = XCTestExpectation(description: "coordinator returns to idle")
+        coordinator.onStateChange = { state in
+            if state == .idle {
+                idleExpectation.fulfill()
+            }
+        }
+
+        XCTAssertTrue(coordinator.start(isProvisional: true))
+        coordinator.stop()
+        XCTAssertFalse(coordinator.isProvisional)
+        await fulfillment(of: [idleExpectation], timeout: 1.0)
+
+        XCTAssertEqual(typingService.outputs, ["hello"])
+        XCTAssertEqual(mediaPlaybackService.pauseCallCount, 0)
     }
 
     func testStartFailsWhenAlreadyRecording() {
@@ -143,6 +222,71 @@ final class DictationCoordinatorTests: XCTestCase {
         XCTAssertEqual(typingService.targetProcessIDs, [nil])
     }
 
+    func testStopWithTailKeepsRecordingThroughTheTail() async {
+        audioCapture.storedSamples = makeLoudSamples()
+        transcriptionService.transcribeResult = .success("hello world")
+        let idleExpectation = XCTestExpectation(description: "coordinator returns to idle")
+        coordinator.onStateChange = { state in
+            if state == .idle {
+                idleExpectation.fulfill()
+            }
+        }
+
+        XCTAssertTrue(coordinator.start())
+        coordinator.stop(tail: .milliseconds(50))
+        XCTAssertTrue(coordinator.isTranscribing)
+        XCTAssertFalse(audioCapture.didStop)
+        // The last word, still arriving after the key came up.
+        audioCapture.storedSamples += makeLoudSamples(count: 800)
+
+        await fulfillment(of: [idleExpectation], timeout: 1.0)
+        XCTAssertTrue(audioCapture.didStop)
+        XCTAssertEqual(dictationHistoryStore.sessions.first?.samples.count, 16_800)
+        XCTAssertEqual(typingService.outputs, ["hello world"])
+    }
+
+    func testStopWithTailJudgesSpeechOnAudioBeforeTheTail() async {
+        // A stop cue picked up during the tail is loud but is not speech.
+        audioCapture.storedSamples = Array(repeating: 0.001, count: 16_000)
+        let idleExpectation = XCTestExpectation(description: "coordinator returns to idle")
+        coordinator.onStateChange = { state in
+            if state == .idle {
+                idleExpectation.fulfill()
+            }
+        }
+        var noSpeechCount = 0
+        coordinator.onNoSpeechDetected = { noSpeechCount += 1 }
+
+        XCTAssertTrue(coordinator.start())
+        coordinator.stop(tail: .milliseconds(50))
+        audioCapture.storedSamples += makeLoudSamples(count: 3_200)
+
+        await fulfillment(of: [idleExpectation], timeout: 1.0)
+        XCTAssertEqual(noSpeechCount, 1)
+        XCTAssertTrue(typingService.outputs.isEmpty)
+        XCTAssertTrue(dictationHistoryStore.sessions.isEmpty)
+        XCTAssertTrue(coordinator.canStart)
+        XCTAssertFalse(coordinator.isPreventingIdleSleep)
+    }
+
+    func testCancelDuringTailDiscardsTheSession() async throws {
+        audioCapture.storedSamples = makeLoudSamples()
+        transcriptionService.transcribeResult = .success("hello world")
+
+        XCTAssertTrue(coordinator.start())
+        coordinator.stop(tail: .milliseconds(50))
+        coordinator.cancel()
+        XCTAssertTrue(coordinator.isIdle)
+        XCTAssertTrue(audioCapture.didStop)
+
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertTrue(coordinator.isIdle)
+        XCTAssertTrue(coordinator.canStart)
+        XCTAssertTrue(typingService.outputs.isEmpty)
+        XCTAssertTrue(dictationHistoryStore.sessions.isEmpty)
+        XCTAssertEqual(mediaPlaybackService.resumeCallCount, 1)
+    }
+
     func testStopWithSpeechSavesDictationHistoryAfterTranscriptionCompletes() async {
         audioCapture.storedSamples = makeLoudSamples()
         transcriptionService.currentModelID = AppMode.parakeetModelId
@@ -165,6 +309,44 @@ final class DictationCoordinatorTests: XCTestCase {
         XCTAssertEqual(dictationHistoryStore.sessions[0].transcript, " troy and abed in the morning ")
         XCTAssertEqual(dictationHistoryStore.sessions[0].modelID, AppMode.parakeetModelId)
         XCTAssertEqual(dictationHistoryStore.sessions[0].language, Constants.defaultLanguage)
+    }
+
+    func testHistoryRecordsTheAppDictatedInto() async {
+        let tests: [String: (targetProcessID: pid_t?, want: DictatedApp?)] = [
+            "known app": (42, DictatedApp(name: "Greendale Messenger", bundleID: "edu.greendale.messenger")),
+            "app gone": (43, nil),
+            "no target": (nil, nil)
+        ]
+        dictatedApps = [42: DictatedApp(name: "Greendale Messenger", bundleID: "edu.greendale.messenger")]
+
+        for (name, tc) in tests {
+            dictationHistoryStore = FakeDictationHistoryStore()
+            let coordinator = DictationCoordinator(
+                audioCapture: audioCapture,
+                transcriptionService: transcriptionService,
+                typingService: typingService,
+                mediaPlaybackService: mediaPlaybackService,
+                dictationHistoryStore: dictationHistoryStore,
+                postProcessingProvider: postProcessor,
+                isPostProcessingEnabled: { false },
+                replacementEntriesProvider: { [] },
+                dictatedAppResolver: { [weak self] processID in self?.dictatedApps[processID] }
+            )
+            audioCapture.storedSamples = makeLoudSamples()
+            transcriptionService.transcribeResult = .success("cool cool cool")
+            let idle = XCTestExpectation(description: "\(name): back to idle")
+            coordinator.onStateChange = { state in
+                if state == .idle {
+                    idle.fulfill()
+                }
+            }
+
+            XCTAssertTrue(coordinator.start(targetProcessID: tc.targetProcessID), name)
+            coordinator.stop()
+            await fulfillment(of: [idle], timeout: 1.0)
+
+            XCTAssertEqual(dictationHistoryStore.sessions.first?.app, tc.want, name)
+        }
     }
 
     func testStopWithSpeechResumesMediaAfterTranscriptionCompletes() async {
@@ -368,7 +550,9 @@ final class DictationCoordinatorTests: XCTestCase {
         limitedCoordinator.onRecordingLimitReached = { limitReached.fulfill() }
         let idleExpectation = XCTestExpectation(description: "coordinator returns to idle after limit stop")
         limitedCoordinator.onStateChange = { state in
-            if state == .idle { idleExpectation.fulfill() }
+            if state == .idle {
+                idleExpectation.fulfill()
+            }
         }
 
         XCTAssertTrue(limitedCoordinator.start())
@@ -636,10 +820,7 @@ final class DictationCoordinatorTests: XCTestCase {
         XCTAssertTrue(coordinator.isIdle)
         XCTAssertTrue(audioCapture.didStop)
         XCTAssertTrue(typingService.outputs.isEmpty)
-        guard let surfacedError else {
-            return XCTFail("input-unavailable error was not surfaced")
-        }
-        guard case .inputUnavailable = surfacedError else {
+        guard let surfacedError, case .inputUnavailable = surfacedError else {
             return XCTFail("input-unavailable error was not surfaced")
         }
     }
@@ -709,6 +890,328 @@ final class DictationCoordinatorTests: XCTestCase {
 
         await fulfillment(of: [idleExpectation], timeout: 1.0)
         XCTAssertNotNil(reportedError)
+    }
+
+    // MARK: - Failed dictation retry
+
+    private func failDictation(samples: [Float]) async {
+        audioCapture.storedSamples = samples
+        transcriptionService.transcribeResult = .failure(NSError(domain: "Greendale", code: 42))
+        let idleExpectation = expectationForIdle()
+        XCTAssertTrue(coordinator.start(targetProcessID: 12_345))
+        coordinator.stop()
+        await fulfillment(of: [idleExpectation], timeout: 1.0)
+    }
+
+    private func retryAndWaitForIdle(targetProcessID: pid_t? = nil) async {
+        let idleExpectation = expectationForIdle()
+        XCTAssertTrue(coordinator.retryFailedDictation(targetProcessID: targetProcessID))
+        await fulfillment(of: [idleExpectation], timeout: 1.0)
+    }
+
+    func testTranscriptionFailureKeepsRecordingForRetry() async {
+        XCTAssertFalse(coordinator.hasFailedDictation)
+
+        // The UI tells the user the recording was kept, so it must already be
+        // kept when the error is reported.
+        var keptWhenReported = false
+        coordinator.onTranscriptionError = { [unowned self] _ in
+            keptWhenReported = coordinator.hasFailedDictation
+        }
+
+        await failDictation(samples: makeLoudSamples())
+
+        XCTAssertTrue(coordinator.isIdle)
+        XCTAssertTrue(keptWhenReported)
+        XCTAssertTrue(coordinator.hasFailedDictation)
+        XCTAssertTrue(typingService.outputs.isEmpty)
+    }
+
+    func testRetryFailedDictationOutputsTextAndClearsRecording() async {
+        let samples = makeLoudSamples(count: 24_000)
+        await failDictation(samples: samples)
+        let resetStreamingCallCount = transcriptionService.resetStreamingCallCount
+        let streamingCallCount = transcriptionService.streamingSampleCounts.count
+
+        transcriptionService.transcribeResult = .success("troy and abed in the morning")
+        var states: [DictationCoordinator.State] = []
+        let idleExpectation = XCTestExpectation(description: "retry returns to idle")
+        coordinator.onStateChange = { state in
+            states.append(state)
+            if state == .idle {
+                idleExpectation.fulfill()
+            }
+        }
+
+        XCTAssertTrue(coordinator.retryFailedDictation(targetProcessID: 54_321))
+        XCTAssertTrue(coordinator.isTranscribing)
+        XCTAssertTrue(coordinator.isRetryingFailedDictation)
+        XCTAssertFalse(coordinator.canStart)
+
+        await fulfillment(of: [idleExpectation], timeout: 1.0)
+
+        guard states.count == 2, case .transcribing = states[0] else {
+            return XCTFail("retry should announce transcribing, then idle; got \(states)")
+        }
+        XCTAssertEqual(states[1], .idle)
+        XCTAssertFalse(coordinator.isRetryingFailedDictation)
+        XCTAssertFalse(coordinator.hasFailedDictation)
+        // Delivered into the app focused at retry time, not the original target.
+        XCTAssertEqual(typingService.outputs, ["troy and abed in the morning"])
+        XCTAssertEqual(typingService.targetProcessIDs, [54_321])
+        // The normal pipeline runs on the kept audio, history included.
+        XCTAssertEqual(dictationHistoryStore.sessions.count, 1)
+        XCTAssertEqual(dictationHistoryStore.sessions.first?.samples, samples)
+        // A retry does not record, so it neither previews nor touches media:
+        // the single pause/resume pair belongs to the original recording.
+        XCTAssertEqual(transcriptionService.resetStreamingCallCount, resetStreamingCallCount)
+        XCTAssertEqual(transcriptionService.streamingSampleCounts.count, streamingCallCount)
+        XCTAssertEqual(mediaPlaybackService.pauseCallCount, 1)
+        XCTAssertEqual(mediaPlaybackService.resumeCallCount, 1)
+    }
+
+    func testRetryFailureKeepsRecordingForAnotherTry() async {
+        let samples = makeLoudSamples()
+        await failDictation(samples: samples)
+
+        var errorCount = 0
+        coordinator.onTranscriptionError = { _ in errorCount += 1 }
+
+        await retryAndWaitForIdle()
+
+        XCTAssertEqual(errorCount, 1)
+        XCTAssertTrue(coordinator.hasFailedDictation)
+        XCTAssertTrue(typingService.outputs.isEmpty)
+        XCTAssertTrue(dictationHistoryStore.sessions.isEmpty)
+
+        transcriptionService.transcribeResult = .success("six seasons and a movie")
+        await retryAndWaitForIdle()
+
+        XCTAssertEqual(errorCount, 1)
+        XCTAssertFalse(coordinator.hasFailedDictation)
+        XCTAssertEqual(typingService.outputs, ["six seasons and a movie"])
+        XCTAssertEqual(dictationHistoryStore.sessions.last?.samples, samples)
+    }
+
+    func testRetryWithoutFailedDictationIsRejected() {
+        var stateChangeCount = 0
+        coordinator.onStateChange = { _ in stateChangeCount += 1 }
+
+        XCTAssertFalse(coordinator.retryFailedDictation())
+
+        XCTAssertTrue(coordinator.isIdle)
+        XCTAssertEqual(stateChangeCount, 0)
+    }
+
+    private func dictate(_ result: Result<String, Error>) async {
+        audioCapture.storedSamples = makeLoudSamples()
+        transcriptionService.transcribeResult = result
+        let idleExpectation = expectationForIdle()
+        XCTAssertTrue(coordinator.start(targetProcessID: 12_345))
+        coordinator.stop()
+        await fulfillment(of: [idleExpectation], timeout: 1.0)
+    }
+
+    func testLastTranscriptRemembersWhatWasDelivered() async {
+        XCTAssertNil(coordinator.lastTranscript)
+
+        replacementEntries = [ReplacementEntry(triggers: ["greendale"], replacement: "Greendale Community College")]
+        await dictate(.success("  welcome to greendale  "))
+        XCTAssertEqual(coordinator.lastTranscript, "welcome to Greendale Community College")
+        XCTAssertEqual(coordinator.lastTranscript, typingService.outputs.last)
+
+        await dictate(.success("señor chang"))
+        XCTAssertEqual(coordinator.lastTranscript, "señor chang", "a newer dictation replaces it")
+
+        await dictate(.failure(NSError(domain: "Greendale", code: 42)))
+        XCTAssertEqual(coordinator.lastTranscript, "señor chang", "a failure keeps the previous one")
+
+        await dictate(.success("   "))
+        XCTAssertEqual(coordinator.lastTranscript, "señor chang", "nothing delivered keeps the previous one")
+
+        transcriptionService.transcribeResult = .success("troy and abed")
+        await retryAndWaitForIdle()
+        XCTAssertEqual(coordinator.lastTranscript, "troy and abed", "a successful retry counts")
+    }
+
+    func testDiscardFailedDictationDropsRecording() async {
+        XCTAssertFalse(coordinator.discardFailedDictation(), "nothing kept, nothing to discard")
+
+        await failDictation(samples: makeLoudSamples())
+        XCTAssertTrue(coordinator.discardFailedDictation())
+
+        XCTAssertFalse(coordinator.hasFailedDictation)
+        XCTAssertFalse(coordinator.retryFailedDictation())
+    }
+
+    func testDiscardIsRefusedWhileRetryIsInFlight() async {
+        await failDictation(samples: makeLoudSamples())
+
+        transcriptionService.holdTranscribeUntilReleased = true
+        transcriptionService.transcribeResult = .success("señor chang")
+        let transcribeStarted = XCTestExpectation(description: "retry transcription started")
+        transcriptionService.onTranscribeStarted = { transcribeStarted.fulfill() }
+        let idleExpectation = expectationForIdle()
+
+        XCTAssertTrue(coordinator.retryFailedDictation(targetProcessID: 54_321))
+        await fulfillment(of: [transcribeStarted], timeout: 1.0)
+
+        XCTAssertFalse(coordinator.discardFailedDictation())
+        XCTAssertTrue(coordinator.hasFailedDictation)
+
+        transcriptionService.releaseTranscribe()
+        await fulfillment(of: [idleExpectation], timeout: 1.0)
+        XCTAssertEqual(typingService.outputs, ["señor chang"])
+        XCTAssertFalse(coordinator.hasFailedDictation)
+    }
+
+    func testRetryIsRejectedWhileRecording() async {
+        await failDictation(samples: makeLoudSamples())
+
+        XCTAssertTrue(coordinator.start())
+        XCTAssertFalse(coordinator.retryFailedDictation())
+
+        XCTAssertTrue(coordinator.isRecording)
+        XCTAssertFalse(coordinator.isRetryingFailedDictation)
+        XCTAssertTrue(coordinator.hasFailedDictation)
+        coordinator.cancel()
+    }
+
+    func testRetryIsRejectedWhileTranscribing() async {
+        await failDictation(samples: makeLoudSamples())
+
+        transcriptionService.transcribeResult = .success("cool cool cool")
+        transcriptionService.transcribeDelay = .milliseconds(50)
+        let idleExpectation = expectationForIdle()
+        XCTAssertTrue(coordinator.start())
+        coordinator.stop()
+        XCTAssertTrue(coordinator.isTranscribing)
+
+        XCTAssertFalse(coordinator.retryFailedDictation())
+        XCTAssertFalse(coordinator.isRetryingFailedDictation)
+
+        await fulfillment(of: [idleExpectation], timeout: 1.0)
+        XCTAssertEqual(typingService.outputs, ["cool cool cool"])
+        // Only a successful retry discards the kept recording; an unrelated
+        // dictation succeeding does not.
+        XCTAssertTrue(coordinator.hasFailedDictation)
+    }
+
+    func testCancelDuringRetryKeepsRecordingAndDiscardsResult() async {
+        let samples = makeLoudSamples()
+        await failDictation(samples: samples)
+
+        // Park the retry's inference so cancel() lands mid-flight, and let it
+        // finish afterwards the way uncancellable on-device inference does.
+        transcriptionService.holdTranscribeUntilReleased = true
+        transcriptionService.ignoresCancellationAfterTranscribeHold = true
+        transcriptionService.transcribeResult = .success("ignored")
+        let transcribeStarted = XCTestExpectation(description: "retry transcription started")
+        transcriptionService.onTranscribeStarted = { transcribeStarted.fulfill() }
+
+        XCTAssertTrue(coordinator.retryFailedDictation(targetProcessID: 54_321))
+        XCTAssertFalse(coordinator.retryFailedDictation(), "a second retry must wait for the first")
+        await fulfillment(of: [transcribeStarted], timeout: 1.0)
+
+        coordinator.cancel()
+        XCTAssertTrue(coordinator.isIdle)
+        XCTAssertTrue(coordinator.canStart)
+        XCTAssertFalse(coordinator.isRetryingFailedDictation)
+
+        let noOutput = expectation(description: "no output after cancel")
+        noOutput.isInverted = true
+        typingService.onOutput = { _ in noOutput.fulfill() }
+        let noError = expectation(description: "no transcription error after cancel")
+        noError.isInverted = true
+        coordinator.onTranscriptionError = { _ in noError.fulfill() }
+
+        transcriptionService.releaseTranscribe()
+        await fulfillment(of: [noOutput, noError], timeout: 1.0)
+
+        XCTAssertTrue(dictationHistoryStore.sessions.isEmpty)
+        // Cancelling (a model switch does this) must not throw the audio away.
+        XCTAssertTrue(coordinator.hasFailedDictation)
+        XCTAssertEqual(mediaPlaybackService.pauseCallCount, 1)
+        XCTAssertEqual(mediaPlaybackService.resumeCallCount, 1)
+
+        transcriptionService.holdTranscribeUntilReleased = false
+        transcriptionService.ignoresCancellationAfterTranscribeHold = false
+        transcriptionService.onTranscribeStarted = nil
+        transcriptionService.transcribeResult = .success("troy barnes")
+        typingService.onOutput = nil
+        coordinator.onTranscriptionError = nil
+        await retryAndWaitForIdle()
+
+        XCTAssertEqual(typingService.outputs, ["troy barnes"])
+        XCTAssertFalse(coordinator.hasFailedDictation)
+    }
+
+    func testCancelledDictationDoesNotKeepRecording() async {
+        audioCapture.storedSamples = makeLoudSamples()
+        XCTAssertTrue(coordinator.start())
+        coordinator.cancel()
+        XCTAssertFalse(coordinator.hasFailedDictation)
+
+        // A failure that surfaces only after cancel() belongs to an abandoned
+        // session and must not be kept either.
+        transcriptionService.holdTranscribeUntilReleased = true
+        transcriptionService.ignoresCancellationAfterTranscribeHold = true
+        transcriptionService.transcribeResult = .failure(NSError(domain: "Greendale", code: 42))
+        let transcribeStarted = XCTestExpectation(description: "transcription started")
+        transcriptionService.onTranscribeStarted = { transcribeStarted.fulfill() }
+        let noError = expectation(description: "no transcription error after cancel")
+        noError.isInverted = true
+        coordinator.onTranscriptionError = { _ in noError.fulfill() }
+
+        XCTAssertTrue(coordinator.start())
+        coordinator.stop()
+        await fulfillment(of: [transcribeStarted], timeout: 1.0)
+        coordinator.cancel()
+        transcriptionService.releaseTranscribe()
+        await fulfillment(of: [noError], timeout: 1.0)
+
+        XCTAssertFalse(coordinator.hasFailedDictation)
+    }
+
+    func testDictationsWithoutTranscriptionFailureDoNotKeepRecording() async {
+        let cases: [String: (samples: [Float], result: Result<String, Error>)] = [
+            // The speech gate ends the session before transcription runs, so
+            // the configured failure is never reached.
+            "no speech in audio": (
+                [Float](repeating: 0, count: 16_000),
+                .failure(NSError(domain: "Greendale", code: 42))
+            ),
+            "empty transcript": (makeLoudSamples(), .success("   ")),
+            "transcript typed": (makeLoudSamples(), .success("troy barnes")),
+            "transcription cancelled": (makeLoudSamples(), .failure(CancellationError())),
+        ]
+
+        for (name, tc) in cases {
+            audioCapture.storedSamples = tc.samples
+            transcriptionService.transcribeResult = tc.result
+            let idleExpectation = expectationForIdle()
+
+            XCTAssertTrue(coordinator.start(), name)
+            coordinator.stop()
+            await fulfillment(of: [idleExpectation], timeout: 1.0)
+
+            XCTAssertFalse(coordinator.hasFailedDictation, name)
+        }
+    }
+
+    func testNewerFailureReplacesOlderRecording() async {
+        let older = makeLoudSamples(count: 16_000)
+        let newer = makeLoudSamples(count: 32_000)
+        await failDictation(samples: older)
+        await failDictation(samples: newer)
+
+        transcriptionService.transcribeResult = .success("cool cool cool")
+        await retryAndWaitForIdle()
+
+        XCTAssertEqual(typingService.outputs, ["cool cool cool"])
+        XCTAssertEqual(dictationHistoryStore.sessions.count, 1)
+        XCTAssertEqual(dictationHistoryStore.sessions.first?.samples, newer)
+        XCTAssertFalse(coordinator.hasFailedDictation)
     }
 
     // MARK: - Post-processing
@@ -827,6 +1330,26 @@ final class DictationCoordinatorTests: XCTestCase {
         XCTAssertEqual(session.rawTranscript, "troy and abed")
         XCTAssertTrue(session.wasPostProcessed)
         XCTAssertNil(session.postProcessingErrorDescription)
+    }
+
+    func testPostProcessingReceivesTheTargetAppName() async {
+        postProcessingEnabled = true
+        postProcessor.result = .success("Hello.")
+        dictatedApps = [42: DictatedApp(name: "Greendale Messenger", bundleID: "edu.greendale.messenger")]
+        audioCapture.storedSamples = makeLoudSamples()
+        transcriptionService.transcribeResult = .success("hello")
+        let idleExpectation = XCTestExpectation(description: "coordinator returns to idle")
+        coordinator.onStateChange = { state in
+            if state == .idle {
+                idleExpectation.fulfill()
+            }
+        }
+
+        XCTAssertTrue(coordinator.start(targetProcessID: 42))
+        coordinator.stop()
+        await fulfillment(of: [idleExpectation], timeout: 1.0)
+
+        XCTAssertEqual(postProcessor.lastAppName, "Greendale Messenger")
     }
 
     func testPostProcessingInstructionsContainDictationCapabilities() {
@@ -1265,7 +1788,7 @@ final class FakeTranscriptionService: TranscriptionProtocol, @unchecked Sendable
     private var _transcribeResult: Result<String, Error> = .success("")
     private var _streamingDelay: Duration?
     private var _transcribeDelay: Duration?
-    private var _currentModelID: String? = AppMode.nemotronModelId
+    private var _currentModelID: String? = AppMode.parakeetUnifiedModelId
     private var _streamingSampleCounts: [Int] = []
     private var _resetStreamingCallCount = 0
     private var _callOrder: [Call] = []
@@ -1548,6 +2071,7 @@ final class FakePostProcessingProvider: PostProcessingProvider, @unchecked Senda
     private var _sequentialIndex = 0
     private var _processCallCount = 0
     private var _lastProcessedInput: String?
+    private var _lastAppName: String?
     private var _holdUntilReleased = false
     private var _processRelease: CheckedContinuation<Void, Never>?
     private var _onProcessStarted: (() -> Void)?
@@ -1579,6 +2103,10 @@ final class FakePostProcessingProvider: PostProcessingProvider, @unchecked Senda
         lock.withLock { _lastProcessedInput }
     }
 
+    var lastAppName: String? {
+        lock.withLock { _lastAppName }
+    }
+
     var holdUntilReleased: Bool {
         get { lock.withLock { _holdUntilReleased } }
         set { lock.withLock { _holdUntilReleased = newValue } }
@@ -1599,10 +2127,11 @@ final class FakePostProcessingProvider: PostProcessingProvider, @unchecked Senda
         continuation?.resume()
     }
 
-    func process(_ transcript: String) async throws -> String {
+    func process(_ transcript: String, appName: String?) async throws -> String {
         let snapshot = lock.withLock {
             _processCallCount += 1
             _lastProcessedInput = transcript
+            _lastAppName = appName
             let result: Result<String, Error>
             if !_sequentialResults.isEmpty {
                 let index = min(_sequentialIndex, _sequentialResults.count - 1)

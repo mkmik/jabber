@@ -11,6 +11,9 @@ final class AudioCaptureService {
     private let converterQueue = DispatchQueue(label: "com.jabber.audioconverter")
     nonisolated(unsafe) private var converter: AVAudioConverter?
     nonisolated private static let initialCapturedSampleCapacity = 16_000 * 60
+    /// Audio kept from just before a warm start: speech that began as the
+    /// hotkey went down would otherwise lose its first syllable.
+    nonisolated static let preRollSampleLimit = 16_000 * 450 / 1_000
 
     nonisolated private let captureState = OSAllocatedUnfairLock(initialState: CaptureState())
     private let logger = Logger(subsystem: "com.rselbach.jabber", category: "AudioCaptureService")
@@ -18,6 +21,9 @@ final class AudioCaptureService {
     private struct CaptureState {
         var lastLevelUpdate: CFAbsoluteTime = 0
         var capturedSamples: [Float] = []
+        /// The newest `preRollSampleLimit` samples heard while the engine
+        /// idles in standby; they open the next session.
+        var preRollSamples: [Float] = []
         var isCapturing = false
         var engineGeneration = 0
         var firstBufferGeneration = 0
@@ -131,7 +137,7 @@ final class AudioCaptureService {
         } catch {
             // Nothing is lost: startCapture() builds on demand and surfaces
             // the failure to the user there.
-            logger.warning("Audio capture prepare failed: \(error.localizedDescription)")
+            logger.warning("Audio capture prepare failed: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -143,11 +149,7 @@ final class AudioCaptureService {
 
         // A device that is still waking up reports a zero-rate format; a tap
         // installed against it never delivers audio.
-        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
-            throw AudioCaptureError.invalidFormat
-        }
-
-        guard let outputFormat = AVAudioFormat(
+        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0, let outputFormat = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
             sampleRate: targetSampleRate,
             channels: 1,
@@ -226,15 +228,24 @@ final class AudioCaptureService {
         }
 
         let engine = audioEngine()
-        // Clear the resampler's filter state so the tail drained at the end of
-        // the previous session cannot bleed into this one.
-        withConverter { $0.reset() }
+        // A warm engine's converter has been running since the reset after
+        // the last drain, so its state already matches the pre-roll. A cold
+        // one starts clean.
+        let isWarm = engine.isRunning
+        if !isWarm {
+            withConverter { $0.reset() }
+        }
 
-        captureState.withLock {
+        let preRollCount = captureState.withLock {
             $0.capturedSamples.removeAll(keepingCapacity: true)
+            if isWarm {
+                $0.capturedSamples.append(contentsOf: $0.preRollSamples)
+            }
+            $0.preRollSamples.removeAll()
             $0.isCapturing = true
             $0.firstBufferGeneration = 0
             $0.captureStartedAt = startedAt
+            return $0.capturedSamples.count
         }
 
         do {
@@ -249,7 +260,7 @@ final class AudioCaptureService {
             stopCapture()
             throw error
         }
-        logger.notice("Audio capture engine ready in \((ContinuousClock.now - startedAt).wholeMilliseconds) ms")
+        logger.notice("Audio capture engine ready in \((ContinuousClock.now - startedAt).wholeMilliseconds) ms with \(preRollCount * 1_000 / 16_000) ms of pre-roll")
     }
 
     private func handleConfigurationChange() {
@@ -273,14 +284,14 @@ final class AudioCaptureService {
             return
         }
         guard inputRecoveryTask == nil else {
-            logger.notice("Coalescing input rebuild after \(reason)")
+            logger.notice("Coalescing input rebuild after \(reason, privacy: .public)")
             return
         }
         if reason != .missingFirstBuffer {
             didRetryMissingFirstBuffer = false
         }
 
-        logger.notice("Scheduling input rebuild because \(reason)")
+        logger.notice("Scheduling input rebuild because \(reason, privacy: .public)")
         inputRecoveryGeneration += 1
         let recoveryGeneration = inputRecoveryGeneration
         inputRecoveryTask = Task { @MainActor [weak self] in
@@ -319,12 +330,12 @@ final class AudioCaptureService {
                 }
                 needsRebuild = false
                 finishInputRecovery(generation: recoveryGeneration)
-                logger.notice("Rebuilt audio input after \(reason)")
+                logger.notice("Rebuilt audio input after \(reason, privacy: .public)")
                 return
             } catch {
                 lastError = error
                 logger.warning(
-                    "Audio input rebuild attempt \(attempt + 1) failed: \(error.localizedDescription)"
+                    "Audio input rebuild attempt \(attempt + 1) failed: \(error.localizedDescription, privacy: .public)"
                 )
                 teardownEngine()
             }
@@ -332,7 +343,7 @@ final class AudioCaptureService {
 
         finishInputRecovery(generation: recoveryGeneration)
         guard wasCapturing, isCapturing else {
-            logger.error("Could not prepare audio input after \(reason): \(lastError.localizedDescription)")
+            logger.error("Could not prepare audio input after \(reason, privacy: .public): \(lastError.localizedDescription, privacy: .public)")
             return
         }
 
@@ -369,6 +380,7 @@ final class AudioCaptureService {
         standbyTask = nil
         guard !isCapturing, let engine = engineStorage as? AVAudioEngine, engine.isRunning else { return }
         engine.stop()
+        captureState.withLock { $0.preRollSamples.removeAll() }
         logger.notice("Audio engine stopped after standby")
     }
 
@@ -394,6 +406,7 @@ final class AudioCaptureService {
         }
 
         setConverter(nil)
+        captureState.withLock { $0.preRollSamples.removeAll() }
         isPrepared = false
         engineStorage = nil
     }
@@ -424,8 +437,12 @@ final class AudioCaptureService {
         scheduleStandbyRetirement()
     }
 
+    /// Flushes the converter's tail into the session, then resets it so the
+    /// standby tap can keep converting pre-roll. Both happen in one converter
+    /// turn: a buffer converted between them would hit an ended stream.
     private func drainConverter() {
         let samples = withConverter { converter -> [Float] in
+            defer { converter.reset() }
             // The sample-rate conversion tail is a fixed few milliseconds; 4096
             // frames at 16kHz is far more than any real filter delay.
             guard let tailBuffer = AVAudioPCMBuffer(
@@ -439,7 +456,7 @@ final class AudioCaptureService {
                 return nil
             }
             if let error {
-                logger.warning("Draining audio converter tail failed: \(error.localizedDescription)")
+                logger.warning("Draining audio converter tail failed: \(error.localizedDescription, privacy: .public)")
                 return []
             }
 
@@ -513,11 +530,9 @@ final class AudioCaptureService {
     }
 
     nonisolated private func processBuffer(_ buffer: AVAudioPCMBuffer, generation: Int) {
-        // The tap keeps firing while the engine idles in standby; drop those
-        // buffers rather than resampling audio no session asked for.
-        guard captureState.withLock({
-            $0.isCapturing && $0.engineGeneration == generation
-        }) else { return }
+        // The tap keeps firing while the engine idles in standby; those
+        // buffers only feed the pre-roll.
+        guard captureState.withLock({ $0.engineGeneration == generation }) else { return }
 
         let rms = calculateRms(from: buffer)
         let now = CFAbsoluteTimeGetCurrent()
@@ -537,22 +552,26 @@ final class AudioCaptureService {
 
         guard let conversionResult = withConverter({ convertBuffer(buffer, using: $0) }) else { return }
         if let error = conversionResult.error {
-            logger.error("Audio conversion failed: \(error.localizedDescription)")
+            logger.error("Audio conversion failed: \(error.localizedDescription, privacy: .public)")
+            // A failed pre-roll buffer costs nothing the user asked for.
+            guard captureState.withLock({ $0.isCapturing }) else { return }
             DispatchQueue.main.async { [weak self] in
                 self?.onConversionError?(AudioCaptureError.conversionFailed(error))
             }
             return
         }
 
-        guard let convertedBuffer = conversionResult.buffer else { return }
-
-        guard let channelData = convertedBuffer.floatChannelData?[0] else { return }
+        guard let convertedBuffer = conversionResult.buffer, let channelData = convertedBuffer.floatChannelData?[0] else { return }
         let frames = Int(convertedBuffer.frameLength)
         guard frames > 0 else { return }
 
         let samples = Array(UnsafeBufferPointer(start: channelData, count: frames))
         let firstAudio: (delay: Duration, generation: Int)? = captureState.withLock {
-            guard $0.isCapturing, $0.engineGeneration == generation else { return nil }
+            guard $0.engineGeneration == generation else { return nil }
+            guard $0.isCapturing else {
+                Self.appendPreRoll(samples, to: &$0.preRollSamples)
+                return nil
+            }
             $0.capturedSamples.append(contentsOf: samples)
             guard $0.firstBufferGeneration != generation else { return nil }
             $0.firstBufferGeneration = generation
@@ -566,6 +585,15 @@ final class AudioCaptureService {
             DispatchQueue.main.async { [weak self] in
                 self?.didReceiveFirstBuffer(generation: firstAudio.generation)
             }
+        }
+    }
+
+    /// Appends `samples`, keeping only the newest `preRollSampleLimit`.
+    nonisolated static func appendPreRoll(_ samples: [Float], to preRoll: inout [Float]) {
+        preRoll.append(contentsOf: samples)
+        let excess = preRoll.count - preRollSampleLimit
+        if excess > 0 {
+            preRoll.removeFirst(excess)
         }
     }
 

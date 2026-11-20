@@ -59,8 +59,7 @@ final class TypingService {
             &focusedElementRef
         )
 
-        guard result == .success, let focusedElementRef else { return nil }
-        guard CFGetTypeID(focusedElementRef) == AXUIElementGetTypeID() else { return nil }
+        guard result == .success, let focusedElementRef, CFGetTypeID(focusedElementRef) == AXUIElementGetTypeID() else { return nil }
 
         let focusedElement = unsafeBitCast(focusedElementRef, to: AXUIElement.self)
         var pid: pid_t = 0
@@ -118,6 +117,9 @@ final class TypingService {
             hasAccessibilityPermission: permissionService.hasAccessibilityPermission()
         ) {
         case .pasteWithRestore:
+            // Fields that don't expose their text get the dictation as is.
+            let text = textBeforeInsertionPoint(targetProcessID: targetProcessID)
+                .map { DictationJoiner.join(text, after: $0) } ?? text
             if let targetProcessID,
                insertUnicodeText(text, targetProcessID: targetProcessID) {
                 return
@@ -139,7 +141,7 @@ final class TypingService {
             // clipboard contents. Copy without restoring and tell the user.
             logger.warning("Accessibility permission not granted; copying transcript without paste")
             copyOnly(text)
-            NotificationService.shared.showWarning(
+            NotificationService.shared.showFeedback(
                 title: "Transcript Copied to Clipboard",
                 message: "Grant Accessibility permission in Privacy & Security to enable direct typing into apps."
             )
@@ -149,10 +151,9 @@ final class TypingService {
     private func copyOnly(_ text: String) {
         let pasteboard = NSPasteboard.general
         guard copyToClipboard(text, pasteboard: pasteboard) else {
-            NotificationService.shared.showError(
+            NotificationService.shared.showFeedback(
                 title: "Copy Failed",
-                message: "Could not copy transcription to clipboard.",
-                critical: false
+                message: "Could not copy transcription to clipboard."
             )
             return
         }
@@ -164,10 +165,9 @@ final class TypingService {
 
         guard copyToClipboard(text, pasteboard: pasteboard) else {
             restoreClipboard(previousClipboard, expectedChangeCount: pasteboard.changeCount)
-            NotificationService.shared.showError(
+            NotificationService.shared.showFeedback(
                 title: "Copy Failed",
-                message: "Could not copy transcription to clipboard.",
-                critical: false
+                message: "Could not copy transcription to clipboard."
             )
             return
         }
@@ -203,10 +203,9 @@ final class TypingService {
                 // so the user can paste manually — restoring the previous
                 // clipboard here would silently discard the transcript while
                 // the notification claims it is available.
-                NotificationService.shared.showError(
+                NotificationService.shared.showFeedback(
                     title: "Paste Failed",
-                    message: "Could not simulate paste command. Text is in clipboard.",
-                    critical: false
+                    message: "Could not simulate paste command. Text is in clipboard."
                 )
                 return
             }
@@ -243,7 +242,7 @@ final class TypingService {
 
         guard snapshot.restore(to: pasteboard) else {
             logger.warning("Failed to restore previous clipboard contents")
-            NotificationService.shared.showWarning(
+            NotificationService.shared.showFeedback(
                 title: "Clipboard Restore Failed",
                 message: "Could not restore your previous clipboard contents. They may have been lost."
             )
@@ -311,9 +310,7 @@ final class TypingService {
     }
 
     private func insertTextViaAccessibility(_ text: String, targetProcessID: pid_t?) -> Bool {
-        guard let element = focusedTextElement(targetProcessID: targetProcessID) else { return false }
-        guard let currentValue = stringValue(from: element) else { return false }
-        guard var selectedRange = selectedTextRange(from: element) else { return false }
+        guard let element = focusedTextElement(targetProcessID: targetProcessID), let currentValue = stringValue(from: element), var selectedRange = selectedTextRange(from: element) else { return false }
 
         let currentNSString = currentValue as NSString
         let maxLength = currentNSString.length
@@ -356,21 +353,38 @@ final class TypingService {
         return true
     }
 
-    private func focusedTextElement(targetProcessID: pid_t?) -> AXUIElement? {
-        if let targetProcessID, targetProcessID > 0 {
-            let appElement = AXUIElementCreateApplication(targetProcessID)
-            return axElementAttribute(from: appElement, attribute: kAXFocusedUIElementAttribute as CFString)
-        }
+    /// Up to `DictationJoiner.lookbehindLength` characters before the
+    /// selection in the focused field, or `nil` when the field doesn't expose
+    /// its text. Reads give up quickly, so a hung app can't stall typing.
+    private func textBeforeInsertionPoint(targetProcessID: pid_t?) -> String? {
+        guard let element = focusedTextElement(targetProcessID: targetProcessID, messagingTimeout: 0.25),
+              let value = stringValue(from: element),
+              let selectedRange = selectedTextRange(from: element) else { return nil }
 
-        let systemWideElement = AXUIElementCreateSystemWide()
-        return axElementAttribute(from: systemWideElement, attribute: kAXFocusedUIElementAttribute as CFString)
+        let nsValue = value as NSString
+        let end = max(0, min(selectedRange.location, nsValue.length))
+        let start = max(0, end - DictationJoiner.lookbehindLength)
+        let range = nsValue.rangeOfComposedCharacterSequences(for: NSRange(location: start, length: end - start))
+        return nsValue.substring(with: NSRange(location: range.location, length: end - range.location))
+    }
+
+    private func focusedTextElement(targetProcessID: pid_t?, messagingTimeout: Float? = nil) -> AXUIElement? {
+        let container = targetProcessID.flatMap { $0 > 0 ? AXUIElementCreateApplication($0) : nil }
+            ?? AXUIElementCreateSystemWide()
+        if let messagingTimeout {
+            AXUIElementSetMessagingTimeout(container, messagingTimeout)
+        }
+        let element = axElementAttribute(from: container, attribute: kAXFocusedUIElementAttribute as CFString)
+        if let element, let messagingTimeout {
+            AXUIElementSetMessagingTimeout(element, messagingTimeout)
+        }
+        return element
     }
 
     private func axElementAttribute(from element: AXUIElement, attribute: CFString) -> AXUIElement? {
         var value: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(element, attribute, &value)
-        guard result == .success, let value else { return nil }
-        guard CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        guard result == .success, let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
         return unsafeBitCast(value, to: AXUIElement.self)
     }
 
@@ -384,8 +398,7 @@ final class TypingService {
     private func selectedTextRange(from element: AXUIElement) -> CFRange? {
         var value: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &value)
-        guard result == .success, let value else { return nil }
-        guard CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+        guard result == .success, let value, CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
 
         var range = CFRange()
         guard AXValueGetValue(unsafeBitCast(value, to: AXValue.self), .cfRange, &range) else { return nil }
