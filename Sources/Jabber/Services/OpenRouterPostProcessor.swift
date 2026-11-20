@@ -80,7 +80,8 @@ private enum OpenAICompatiblePostProcessingError: Error {
 
 /// Shared non-streaming Chat Completions request/response implementation used
 /// by OpenRouter and OpenCode Zen. Provider wrappers own credential checks,
-/// model allowlists, attribution headers, and user-facing error names.
+/// model allowlists, attribution headers, gateway-specific body fields such as
+/// reasoning controls, and user-facing error names.
 private struct OpenAICompatiblePostProcessingClient: Sendable {
     private static let maxHttpFailureMessageLength = 200
 
@@ -88,10 +89,12 @@ private struct OpenAICompatiblePostProcessingClient: Sendable {
     let apiKey: String
     let modelId: String
     let additionalHeaders: [String: String]
+    /// Top-level JSON fields merged into the request body.
+    let additionalBodyFields: [String: any Sendable]
     let requestTimeout: TimeInterval
     let transport: @Sendable (URLRequest) async throws -> (Data, URLResponse)
 
-    func process(_ transcript: String) async throws -> String {
+    func process(_ transcript: String, appName: String?) async throws -> String {
         var request = URLRequest(url: endpoint, timeoutInterval: requestTimeout)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -100,15 +103,16 @@ private struct OpenAICompatiblePostProcessingClient: Sendable {
             request.setValue(value, forHTTPHeaderField: field)
         }
 
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "model": modelId,
             "messages": [
                 ["role": "system", "content": AppleIntelligencePostProcessor.instructions],
-                ["role": "user", "content": transcript]
+                ["role": "user", "content": AppleIntelligencePostProcessor.userMessage(transcript: transcript, appName: appName)]
             ],
             "stream": false,
             "temperature": 0
         ]
+        body.merge(additionalBodyFields) { _, additional in additional }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let data: Data
@@ -148,7 +152,7 @@ private struct OpenAICompatiblePostProcessingClient: Sendable {
             throw OpenAICompatiblePostProcessingError.malformedResponse
         }
 
-        return content
+        return AppleIntelligencePostProcessor.unwrapResponse(content)
     }
 
     /// Both services use the OpenAI-compatible
@@ -184,13 +188,16 @@ private struct OpenAICompatiblePostProcessingClient: Sendable {
 ///   "model": "<slug>",
 ///   "messages": [
 ///     {"role":"system","content":"<AppleIntelligencePostProcessor.instructions>"},
-///     {"role":"user","content":"<raw transcript>"}
+///     {"role":"user","content":"<AppleIntelligencePostProcessor.userMessage>"}
 ///   ],
 ///   "stream": false,
-///   "temperature": 0
+///   "temperature": 0,
+///   "reasoning": {"effort": "<catalog effort>"},
+///   "provider": {"sort": "latency", "zdr": true}
 /// }
 /// ```
-/// Response: `choices[0].message.content` is returned verbatim. An empty/whitespace
+/// Response: `choices[0].message.content` is returned verbatim, minus any
+/// `<transcript>` tags the model echoed. An empty/whitespace
 /// content string is a *valid* outcome (a self-correction like "scratch that"),
 /// not a failure — the coordinator normalizes it and types nothing, matching the
 /// Apple Intelligence contract.
@@ -202,9 +209,11 @@ private struct OpenAICompatiblePostProcessingClient: Sendable {
 struct OpenRouterPostProcessor: PostProcessingProvider {
     static let endpoint = URL(string: "https://openrouter.ai/api/v1/chat/completions")!
 
-    /// 60s: short transcripts normally return in a few seconds. URLRequest's
-    /// timeout is idle-based; the session resource timeout is the total cap.
-    static let requestTimeout: TimeInterval = 60
+    /// 20s: short transcripts normally return in a few seconds, and on
+    /// failure the raw transcript is typed anyway, so a stalled provider
+    /// shouldn't hold the dictation hostage. URLRequest's timeout is
+    /// idle-based; the session resource timeout is the total cap.
+    static let requestTimeout: TimeInterval = 20
 
     private static let defaultSession: URLSession = {
         let configuration = URLSessionConfiguration.default
@@ -214,7 +223,7 @@ struct OpenRouterPostProcessor: PostProcessingProvider {
     }()
 
     let apiKey: String
-    let modelId: String
+    let model: OpenRouterModelCatalog.Model
     let transport: @Sendable (URLRequest) async throws -> (Data, URLResponse)
 
     /// - Parameters:
@@ -230,7 +239,7 @@ struct OpenRouterPostProcessor: PostProcessingProvider {
         }
     ) {
         self.apiKey = apiKey
-        self.modelId = OpenRouterModelCatalog.resolveModelId(modelId)
+        model = OpenRouterModelCatalog.resolveModel(modelId)
         self.transport = transport
     }
 
@@ -242,7 +251,7 @@ struct OpenRouterPostProcessor: PostProcessingProvider {
         !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    func process(_ transcript: String) async throws -> String {
+    func process(_ transcript: String, appName: String?) async throws -> String {
         guard isAvailable else {
             throw OpenRouterPostProcessingError.missingApiKey
         }
@@ -251,14 +260,25 @@ struct OpenRouterPostProcessor: PostProcessingProvider {
             return try await OpenAICompatiblePostProcessingClient(
                 endpoint: Self.endpoint,
                 apiKey: apiKey,
-                modelId: modelId,
+                modelId: model.id,
                 additionalHeaders: [
                     "X-Title": "Jabber",
                     "HTTP-Referer": "https://rselbach.github.io/jabber/"
                 ],
+                additionalBodyFields: [
+                    "reasoning": ["effort": model.reasoningEffort.rawValue],
+                    // Someone is waiting to see their dictation, so take the
+                    // provider answering fastest over OpenRouter's
+                    // price-weighted default. Dictation can be private, so
+                    // only route to providers that retain nothing; every
+                    // catalog model has such endpoints, and a request fails
+                    // to the raw transcript rather than reach one that keeps
+                    // prompts.
+                    "provider": ["sort": "latency", "zdr": true] as [String: any Sendable]
+                ],
                 requestTimeout: Self.requestTimeout,
                 transport: transport
-            ).process(transcript)
+            ).process(transcript, appName: appName)
         } catch let error as OpenAICompatiblePostProcessingError {
             throw OpenRouterPostProcessingError(error)
         }
@@ -281,11 +301,12 @@ private extension OpenRouterPostProcessingError {
 }
 
 /// OpenCode Zen-backed transcript refinement using Zen's OpenAI-compatible
-/// Chat Completions endpoint. The model catalog only includes IDs documented
-/// for this endpoint; other Zen model families use incompatible protocols.
+/// Chat Completions endpoint. The model catalog only includes models whose
+/// native API is this endpoint. Zen is now branded OpenCode Console; this is
+/// its documented pay-as-you-go base URL.
 struct OpenCodeZenPostProcessor: PostProcessingProvider {
-    static let endpoint = URL(string: "https://opencode.ai/zen/v1/chat/completions")!
-    static let requestTimeout: TimeInterval = 60
+    static let endpoint = URL(string: "https://opencode.ai/inference/openai/v1/chat/completions")!
+    static let requestTimeout: TimeInterval = 20
 
     private static let defaultSession: URLSession = {
         let configuration = URLSessionConfiguration.default
@@ -295,7 +316,7 @@ struct OpenCodeZenPostProcessor: PostProcessingProvider {
     }()
 
     let apiKey: String
-    let modelId: String
+    let model: OpenCodeZenModelCatalog.Model
     let transport: @Sendable (URLRequest) async throws -> (Data, URLResponse)
 
     init(
@@ -306,7 +327,7 @@ struct OpenCodeZenPostProcessor: PostProcessingProvider {
         }
     ) {
         self.apiKey = apiKey
-        self.modelId = OpenCodeZenModelCatalog.resolveModelId(modelId)
+        model = OpenCodeZenModelCatalog.resolveModel(modelId)
         self.transport = transport
     }
 
@@ -318,7 +339,7 @@ struct OpenCodeZenPostProcessor: PostProcessingProvider {
         !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    func process(_ transcript: String) async throws -> String {
+    func process(_ transcript: String, appName: String?) async throws -> String {
         guard isAvailable else {
             throw OpenCodeZenPostProcessingError.missingApiKey
         }
@@ -327,11 +348,12 @@ struct OpenCodeZenPostProcessor: PostProcessingProvider {
             return try await OpenAICompatiblePostProcessingClient(
                 endpoint: Self.endpoint,
                 apiKey: apiKey,
-                modelId: modelId,
+                modelId: model.id,
                 additionalHeaders: [:],
+                additionalBodyFields: model.reasoningEffort.map { ["reasoning_effort": $0.rawValue] } ?? [:],
                 requestTimeout: Self.requestTimeout,
                 transport: transport
-            ).process(transcript)
+            ).process(transcript, appName: appName)
         } catch let error as OpenAICompatiblePostProcessingError {
             throw OpenCodeZenPostProcessingError(error)
         }
@@ -387,20 +409,20 @@ struct RoutedPostProcessor: PostProcessingProvider {
         }
     }
 
-    func process(_ transcript: String) async throws -> String {
+    func process(_ transcript: String, appName: String?) async throws -> String {
         switch currentKind() {
         case .appleIntelligence:
-            return try await AppleIntelligencePostProcessor().process(transcript)
+            return try await AppleIntelligencePostProcessor().process(transcript, appName: appName)
         case .openRouter:
             return try await OpenRouterPostProcessor(
                 apiKey: Self.currentApiKey(),
                 modelId: currentModelId()
-            ).process(transcript)
+            ).process(transcript, appName: appName)
         case .openCodeZen:
             return try await OpenCodeZenPostProcessor(
                 apiKey: Self.currentOpenCodeZenApiKey(),
                 modelId: currentOpenCodeZenModelId()
-            ).process(transcript)
+            ).process(transcript, appName: appName)
         }
     }
 
@@ -432,7 +454,7 @@ struct RoutedPostProcessor: PostProcessingProvider {
         do {
             return try OpenRouterKeychain.readKey() ?? ""
         } catch {
-            logger.error("OpenRouter API key read failed: \(error.localizedDescription)")
+            logger.error("OpenRouter API key read failed: \(error.localizedDescription, privacy: .public)")
             return ""
         }
     }
@@ -441,7 +463,7 @@ struct RoutedPostProcessor: PostProcessingProvider {
         do {
             return try OpenCodeZenKeychain.readKey() ?? ""
         } catch {
-            logger.error("OpenCode Zen API key read failed: \(error.localizedDescription)")
+            logger.error("OpenCode Zen API key read failed: \(error.localizedDescription, privacy: .public)")
             return ""
         }
     }

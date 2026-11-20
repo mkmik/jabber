@@ -10,4 +10,3 @@
 --disable elseOnSameLine
 --disable modifierOrder
 --disable numberFormatting
---ifdef no-indent

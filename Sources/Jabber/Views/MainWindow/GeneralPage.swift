@@ -1,6 +1,7 @@
+import AVFoundation
 import SwiftUI
 
-/// Output, media, and update preferences.
+/// Permissions, output, media, startup, and update preferences.
 struct GeneralPage: View {
     @ObservedObject var updaterController: UpdaterController
 
@@ -9,12 +10,30 @@ struct GeneralPage: View {
     @AppStorage(AppSettingKey.pauseMediaDuringRecording) private var pauseMediaDuringRecording = false
     @AppStorage(AppSettingKey.soundFeedbackEnabled) private var soundFeedbackEnabled = true
 
-    @State private var permissionRefreshTick = false
+    @State private var microphoneStatus = AVAuthorizationStatus.notDetermined
+    @State private var isAccessibilityTrusted = false
     @State private var inputDevices: [AudioInputDevice] = []
     @State private var inputDeviceRefreshTick = false
+    @State private var launchAtLoginStatus = LaunchAtLogin.Status.disabled
+    @State private var launchAtLoginError: String?
 
     var body: some View {
         Form {
+            Section {
+                permissionRow(
+                    "Microphone",
+                    status: .microphone(microphoneStatus),
+                    fix: fixMicrophoneAccess
+                )
+                permissionRow(
+                    "Accessibility",
+                    status: .accessibility(isTrusted: isAccessibilityTrusted, isNeeded: isAccessibilityNeeded),
+                    fix: openAccessibilitySettings
+                )
+            } header: {
+                Text("Permissions")
+            }
+
             Section {
                 Picker("Input", selection: $inputDeviceUID) {
                     Text("System Default").tag("")
@@ -46,18 +65,7 @@ struct GeneralPage: View {
                 }
                 .pickerStyle(.radioGroup)
 
-                if selectedOutputMode == .directTyping {
-                    Button("Open Accessibility Settings") {
-                        PermissionService.shared.openPrivacySettings(for: .accessibility)
-                    }
-                    .buttonStyle(.borderless)
-
-                    if !isAccessibilityTrusted {
-                        Text("Accessibility permission is currently disabled. Open Settings to enable it.")
-                            .font(.caption)
-                            .foregroundStyle(.orange)
-                    }
-                } else {
+                if selectedOutputMode == .clipboard {
                     Text("Output will be copied to the clipboard only.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -80,6 +88,44 @@ struct GeneralPage: View {
                 Toggle("Play sounds when dictation starts and stops", isOn: $soundFeedbackEnabled)
             } header: {
                 Text("Feedback")
+            }
+
+            Section {
+                Toggle(
+                    "Open Jabber at login",
+                    isOn: Binding(
+                        get: { launchAtLoginStatus.isOn },
+                        set: setLaunchAtLogin
+                    )
+                )
+                .disabled(launchAtLoginStatus == .unavailable)
+
+                if let launchAtLoginError {
+                    Text(launchAtLoginError)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                } else {
+                    switch launchAtLoginStatus {
+                    case .requiresApproval:
+                        HStack {
+                            Text("Switched off in Login Items. Turn Jabber on there to open it at login.")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                            Spacer()
+                            Button("Open Login Items") {
+                                LaunchAtLogin.openLoginItemsSettings()
+                            }
+                        }
+                    case .unavailable:
+                        Text("Available only when Jabber runs from its app bundle.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    case .enabled, .disabled:
+                        EmptyView()
+                    }
+                }
+            } header: {
+                Text("Startup")
             }
 
             Section {
@@ -107,7 +153,8 @@ struct GeneralPage: View {
         .onAppear {
             outputMode = TypingService.migratedOutputModeRawValue(outputMode)
             refreshInputDevices()
-            permissionRefreshTick.toggle()
+            refreshPermissions()
+            refreshLaunchAtLogin()
         }
         .onChange(of: inputDeviceUID) {
             AudioInputDeviceMonitor.shared.selectionDidChange()
@@ -115,9 +162,86 @@ struct GeneralPage: View {
         .onReceive(NotificationCenter.default.publisher(for: Constants.Notifications.audioInputDevicesDidChange)) { _ in
             refreshInputDevices()
         }
+        // Picks up changes made in System Settings once the user is back.
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            permissionRefreshTick.toggle()
+            refreshPermissions()
+            refreshLaunchAtLogin()
         }
+    }
+
+    private func permissionRow(
+        _ title: String,
+        status: PermissionStatus,
+        fix: @escaping () -> Void
+    ) -> some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                Text(status.detail)
+                    .font(.caption)
+                    .foregroundStyle(status.needsAttention ? .orange : .secondary)
+            }
+
+            Spacer()
+
+            if status.isGranted {
+                Label("Granted", systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+            } else {
+                switch status.action {
+                case .requestAccess:
+                    Button("Allow", action: fix)
+                case .openSettings:
+                    Button("Open Settings", action: fix)
+                case .none:
+                    EmptyView()
+                }
+            }
+        }
+    }
+
+    /// Typing into apps and lone-key hotkeys both need Accessibility.
+    private var isAccessibilityNeeded: Bool {
+        selectedOutputMode == .directTyping || TypedSettings.hotkeyShortcut.needsAccessibility
+    }
+
+    private func refreshPermissions() {
+        microphoneStatus = PermissionService.shared.microphoneAuthorizationStatus()
+        isAccessibilityTrusted = PermissionService.shared.refreshAccessibilityPermissionStatus()
+    }
+
+    private func refreshLaunchAtLogin() {
+        launchAtLoginStatus = LaunchAtLogin.status
+    }
+
+    private func setLaunchAtLogin(_ enabled: Bool) {
+        do {
+            try LaunchAtLogin.setEnabled(enabled)
+            launchAtLoginError = nil
+        } catch {
+            launchAtLoginError = "Couldn't \(enabled ? "add Jabber to" : "remove Jabber from") Login Items: \(error.localizedDescription)"
+        }
+        refreshLaunchAtLogin()
+    }
+
+    /// Asks the first time; after a denial only System Settings can change it.
+    private func fixMicrophoneAccess() {
+        guard microphoneStatus == .notDetermined else {
+            PermissionService.shared.openPrivacySettings(for: .microphone)
+            return
+        }
+        Task {
+            _ = await PermissionService.shared.requestMicrophonePermission()
+            refreshPermissions()
+        }
+    }
+
+    /// Prompting first adds Jabber to the Accessibility list, so the user
+    /// only has to switch it on.
+    private func openAccessibilitySettings() {
+        _ = PermissionService.shared.requestAccessibilityPermission()
+        PermissionService.shared.openPrivacySettings(for: .accessibility)
+        refreshPermissions()
     }
 
     private var selectedOutputMode: TypingService.OutputMode {
@@ -142,11 +266,6 @@ struct GeneralPage: View {
     private func refreshInputDevices() {
         inputDevices = AudioInputDeviceMonitor.shared.devices
         inputDeviceRefreshTick.toggle()
-    }
-
-    private var isAccessibilityTrusted: Bool {
-        _ = permissionRefreshTick
-        return PermissionService.shared.hasAccessibilityPermission()
     }
 }
 

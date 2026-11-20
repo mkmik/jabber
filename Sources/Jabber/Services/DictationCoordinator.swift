@@ -93,7 +93,17 @@ final class DictationCoordinator {
         case transcribing(sessionID: UUID)
     }
 
-    private(set) var state: State = .idle
+    private(set) var state: State = .idle {
+        didSet { updateIdleSleepActivity() }
+    }
+
+    /// Keeps the Mac from idle-sleeping mid-session: a long hands-free
+    /// dictation has no keyboard or mouse input to hold it awake.
+    private var idleSleepActivity: NSObjectProtocol?
+
+    var isPreventingIdleSleep: Bool {
+        idleSleepActivity != nil
+    }
 
     var isIdle: Bool {
         state == .idle
@@ -104,14 +114,36 @@ final class DictationCoordinator {
     }
 
     var isRecording: Bool {
-        if case .recording = state { return true }
+        if case .recording = state {
+            return true
+        }
         return false
     }
 
     var isTranscribing: Bool {
-        if case .transcribing = state { return true }
+        if case .transcribing = state {
+            return true
+        }
         return false
     }
+
+    /// Whether audio from a dictation whose transcription failed is kept for
+    /// `retryFailedDictation(targetProcessID:)`.
+    var hasFailedDictation: Bool {
+        failedDictationSamples != nil
+    }
+
+    /// Whether the current session re-transcribes a kept failed dictation
+    /// instead of audio that was just recorded.
+    private(set) var isRetryingFailedDictation = false
+
+    /// Whether the recording may still turn out to be an accidental tap: it
+    /// captures audio but has not paused media. See `confirmRecording()`.
+    private(set) var isProvisional = false
+
+    /// The text most recently delivered to an app, kept in memory only so the
+    /// status menu can paste it again.
+    private(set) var lastTranscript: String?
 
     var onStateChange: ((State) -> Void)?
     var onAudioLevel: ((Float) -> Void)?
@@ -153,16 +185,24 @@ final class DictationCoordinator {
     private var streamingTask: Task<Void, Never>?
     private var currentSessionID: UUID?
     private var currentTargetProcessID: pid_t?
+    /// Audio of the most recent dictation whose transcription failed, so one
+    /// engine error cannot lose a long recording. Only one is kept (~57MB at
+    /// the session limit): a newer failure replaces it, a successful retry
+    /// drops it.
+    private var failedDictationSamples: [Float]?
     private var lastStreamingPreviewSampleCount = 0
     private var lastStreamingPreviewText = ""
     private var streamingPreviewStabilizer = StreamingPreviewStabilizer()
     private let streamingPreviewInterval: Duration
     private let minimumStreamingPreviewSampleCount: Int
     private let streamingPreviewStopTimeout: Duration
-    private let maxRecordingDuration: Duration
+    /// Recordings stop automatically after this long; the overlay counts down
+    /// to it.
+    let maxRecordingDuration: Duration
     private var recordingLimitTask: Task<Void, Never>?
     private let isPostProcessingEnabled: @MainActor () -> Bool
     private let replacementEntriesProvider: @MainActor () -> [ReplacementEntry]
+    private let dictatedAppResolver: @MainActor (pid_t) -> DictatedApp?
     private let logger = Logger(subsystem: "com.rselbach.jabber", category: "DictationCoordinator")
 
     init(
@@ -181,7 +221,8 @@ final class DictationCoordinator {
         streamingPreviewStopTimeout: Duration = .seconds(5),
         maxRecordingDuration: Duration = .seconds(900),
         isPostProcessingEnabled: @escaping @MainActor () -> Bool = { TypedSettings[.postProcessingEnabled] },
-        replacementEntriesProvider: @escaping @MainActor () -> [ReplacementEntry] = { TypedSettings.replacementEntries }
+        replacementEntriesProvider: @escaping @MainActor () -> [ReplacementEntry] = { TypedSettings.replacementEntries },
+        dictatedAppResolver: @escaping @MainActor (pid_t) -> DictatedApp? = { DictatedApp(processID: $0) }
     ) {
         self.audioCapture = audioCapture
         self.transcriptionService = transcriptionService
@@ -195,6 +236,7 @@ final class DictationCoordinator {
         self.maxRecordingDuration = maxRecordingDuration
         self.isPostProcessingEnabled = isPostProcessingEnabled
         self.replacementEntriesProvider = replacementEntriesProvider
+        self.dictatedAppResolver = dictatedAppResolver
 
         self.audioCapture.onAudioLevel = { [weak self] level in
             self?.onAudioLevel?(level)
@@ -214,75 +256,204 @@ final class DictationCoordinator {
 
     /// Starts a new dictation session if the coordinator is idle.
     /// Returns `true` if recording began, `false` otherwise.
+    ///
+    /// A provisional start records from the first instant but leaves media
+    /// playing until `confirmRecording()`, so a brushed hotkey that `cancel()`
+    /// then drops leaves no trace.
     @discardableResult
-    func start(targetProcessID: pid_t? = nil) -> Bool {
+    func start(targetProcessID: pid_t? = nil, isProvisional: Bool = false) -> Bool {
         guard canStart else { return false }
 
         let sessionID = UUID()
         currentSessionID = sessionID
         currentTargetProcessID = targetProcessID
 
-        mediaPlaybackService.pauseForDictationIfNeeded()
+        if !isProvisional {
+            mediaPlaybackService.pauseForDictationIfNeeded()
+        }
 
         do {
             try audioCapture.startCapture()
+            self.isProvisional = isProvisional
             state = .recording
             onStateChange?(.recording)
             startStreamingPreview(sessionID: sessionID)
             scheduleRecordingLimit(sessionID: sessionID)
             return true
         } catch {
-            logger.error("Failed to start audio capture: \(error.localizedDescription)")
+            logger.error("Failed to start audio capture: \(error.localizedDescription, privacy: .public)")
             currentSessionID = nil
             currentTargetProcessID = nil
-            mediaPlaybackService.resumeAfterDictationIfNeeded()
+            if !isProvisional {
+                mediaPlaybackService.resumeAfterDictationIfNeeded()
+            }
             onAudioConversionError?(error)
             return false
         }
     }
 
+    /// Commits a provisional recording once the press proved deliberate:
+    /// media pauses now, and stopping transcribes as usual.
+    func confirmRecording() {
+        guard isRecording, isProvisional else { return }
+        isProvisional = false
+        mediaPlaybackService.pauseForDictationIfNeeded()
+    }
+
     /// Stops recording and, if speech was detected, begins transcription.
-    func stop() {
+    ///
+    /// A nonzero `tail` keeps the microphone open that much longer, because
+    /// people let go of the hotkey while still finishing the last word. The
+    /// session reports `.transcribing` at once so the stop cue and overlay
+    /// don't lag, and speech is judged on the audio from before the tail, so
+    /// a stop cue picked up by the microphone can't pass for speech.
+    /// `cancel()` during the tail drops the session as usual.
+    func stop(tail: Duration = .zero) {
         guard case .recording = state, let sessionID = currentSessionID else { return }
+        // Stopping a provisional recording keeps it, without pausing media
+        // for a session that is already ending.
+        isProvisional = false
 
         let stopStartedAt = ContinuousClock.now
         recordingLimitTask?.cancel()
         recordingLimitTask = nil
-        audioCapture.stopCapture()
-
-        let samples = audioCapture.currentSamples()
-        let captureFinishedAt = ContinuousClock.now
         let pendingStreamingTask = stopStreamingPreview()
-        let speechAssessment = AudioSpeechDetector.assess(samples: samples)
 
-        guard speechAssessment.shouldTranscribe else {
-            if speechAssessment.shouldShowNoSpeechWarning {
-                onNoSpeechDetected?()
+        guard tail > .zero else {
+            audioCapture.stopCapture()
+            let samples = audioCapture.currentSamples()
+            let captureFinishedAt = ContinuousClock.now
+            guard assessSpeech(in: samples[...]) else {
+                finish(sessionID: sessionID)
+                return
             }
-            finish(sessionID: sessionID)
+            guard beginTranscribing(sessionID: sessionID) else { return }
+            transcriptionTask = Task { [weak self] in
+                await self?.transcribeAfterStreamingPreview(
+                    pendingStreamingTask,
+                    samples: samples,
+                    sessionID: sessionID,
+                    stopStartedAt: stopStartedAt,
+                    captureFinishedAt: captureFinishedAt
+                )
+            }
             return
         }
 
-        guard activity.start(sessionID) else {
-            logger.error("Could not mark transcription activity active for session \(sessionID.uuidString)")
-            finish(sessionID: sessionID)
-            return
-        }
-
-        state = .transcribing(sessionID: sessionID)
-        onStateChange?(.transcribing(sessionID: sessionID))
-
+        let releasedSampleCount = audioCapture.sampleCount()
+        guard beginTranscribing(sessionID: sessionID) else { return }
         transcriptionTask = Task { [weak self] in
-            if let pendingStreamingTask {
-                await self?.waitForStreamingPreviewToStop(pendingStreamingTask)
+            do {
+                try await Task.sleep(for: tail)
+            } catch is CancellationError {
+                // cancel() owns the session once it cancels the tail.
+                return
+            } catch {
+                self?.logger.error("Release tail sleep failed: \(error.localizedDescription, privacy: .public)")
             }
-            await self?.transcribeAndOutput(
+            guard let self, currentSessionID == sessionID else { return }
+
+            audioCapture.stopCapture()
+            let samples = audioCapture.currentSamples()
+            let captureFinishedAt = ContinuousClock.now
+            guard assessSpeech(in: samples.prefix(releasedSampleCount)) else {
+                _ = activity.complete(sessionID)
+                finish(sessionID: sessionID)
+                return
+            }
+            await transcribeAfterStreamingPreview(
+                pendingStreamingTask,
                 samples: samples,
                 sessionID: sessionID,
                 stopStartedAt: stopStartedAt,
                 captureFinishedAt: captureFinishedAt
             )
         }
+    }
+
+    /// Whether `samples` hold speech worth transcribing. Warns when the
+    /// recording was long enough to count but too quiet.
+    private func assessSpeech(in samples: ArraySlice<Float>) -> Bool {
+        let assessment = AudioSpeechDetector.assess(samples: Array(samples))
+        if assessment.shouldShowNoSpeechWarning {
+            onNoSpeechDetected?()
+        }
+        return assessment.shouldTranscribe
+    }
+
+    /// Claims the activity slot and announces `.transcribing`. Returns
+    /// `false`, with the session finished, when the slot is taken.
+    private func beginTranscribing(sessionID: UUID) -> Bool {
+        guard activity.start(sessionID) else {
+            logger.error("Could not mark transcription activity active for session \(sessionID.uuidString, privacy: .public)")
+            finish(sessionID: sessionID)
+            return false
+        }
+
+        state = .transcribing(sessionID: sessionID)
+        onStateChange?(.transcribing(sessionID: sessionID))
+        return true
+    }
+
+    private func transcribeAfterStreamingPreview(
+        _ pendingStreamingTask: Task<Void, Never>?,
+        samples: [Float],
+        sessionID: UUID,
+        stopStartedAt: ContinuousClock.Instant,
+        captureFinishedAt: ContinuousClock.Instant
+    ) async {
+        if let pendingStreamingTask {
+            await waitForStreamingPreviewToStop(pendingStreamingTask)
+        }
+        await transcribeAndOutput(
+            samples: samples,
+            sessionID: sessionID,
+            stopStartedAt: stopStartedAt,
+            captureFinishedAt: captureFinishedAt
+        )
+    }
+
+    /// Transcribes the kept failed dictation again through the normal
+    /// pipeline and outputs into `targetProcessID`. Returns `false` when
+    /// nothing is kept or a session is active. The audio stays kept when this
+    /// attempt fails or is cancelled.
+    @discardableResult
+    func retryFailedDictation(targetProcessID: pid_t? = nil) -> Bool {
+        guard canStart, let samples = failedDictationSamples else { return false }
+
+        let sessionID = UUID()
+        guard activity.start(sessionID) else {
+            logger.error("Could not mark transcription activity active for retry session \(sessionID.uuidString, privacy: .public)")
+            return false
+        }
+
+        // No recording phase, so no media pause, streaming preview, or
+        // recording limit: the session goes straight to transcribing.
+        currentSessionID = sessionID
+        currentTargetProcessID = targetProcessID
+        isRetryingFailedDictation = true
+        state = .transcribing(sessionID: sessionID)
+        onStateChange?(.transcribing(sessionID: sessionID))
+
+        let startedAt = ContinuousClock.now
+        transcriptionTask = Task { [weak self] in
+            await self?.transcribeAndOutput(
+                samples: samples,
+                sessionID: sessionID,
+                stopStartedAt: startedAt,
+                captureFinishedAt: startedAt
+            )
+        }
+        return true
+    }
+
+    /// Drops the kept failed dictation without retrying it. Refused while a
+    /// retry of it is in flight.
+    @discardableResult
+    func discardFailedDictation() -> Bool {
+        guard failedDictationSamples != nil, !isRetryingFailedDictation else { return false }
+        failedDictationSamples = nil
+        return true
     }
 
     /// Cancels the current session immediately. Any in-flight transcription
@@ -298,6 +469,11 @@ final class DictationCoordinator {
         let sessionID = currentSessionID
         currentSessionID = nil
         currentTargetProcessID = nil
+        // A retry or a provisional recording never paused media, so it has
+        // nothing to resume.
+        let shouldResumeMedia = !isRetryingFailedDictation && !isProvisional
+        isRetryingFailedDictation = false
+        isProvisional = false
         _ = stopStreamingPreview()
         transcriptionTask?.cancel()
         transcriptionTask = nil
@@ -315,7 +491,9 @@ final class DictationCoordinator {
             state = .idle
             onStateChange?(.idle)
         }
-        mediaPlaybackService.resumeAfterDictationIfNeeded()
+        if shouldResumeMedia {
+            mediaPlaybackService.resumeAfterDictationIfNeeded()
+        }
     }
 
     private func startStreamingPreview(sessionID: UUID) {
@@ -352,7 +530,7 @@ final class DictationCoordinator {
                 } catch is CancellationError {
                     return
                 } catch {
-                    logger.error("Streaming preview stop timeout sleep failed: \(error.localizedDescription)")
+                    logger.error("Streaming preview stop timeout sleep failed: \(error.localizedDescription, privacy: .public)")
                     return
                 }
 
@@ -378,7 +556,7 @@ final class DictationCoordinator {
             } catch is CancellationError {
                 return
             } catch {
-                self?.logger.error("Recording limit sleep failed: \(error.localizedDescription)")
+                self?.logger.error("Recording limit sleep failed: \(error.localizedDescription, privacy: .public)")
                 return
             }
             guard !Task.isCancelled else { return }
@@ -418,7 +596,7 @@ final class DictationCoordinator {
             } catch is CancellationError {
                 break
             } catch {
-                logger.error("Streaming preview sleep failed: \(error.localizedDescription)")
+                logger.error("Streaming preview sleep failed: \(error.localizedDescription, privacy: .public)")
                 break
             }
         }
@@ -433,8 +611,7 @@ final class DictationCoordinator {
         // Only one preview loop exists, so slow passes cause ticks to be
         // skipped naturally instead of building an inference queue.
         let totalCount = audioCapture.sampleCount()
-        guard totalCount >= minimumStreamingPreviewSampleCount else { return }
-        guard totalCount > lastStreamingPreviewSampleCount else { return }
+        guard totalCount >= minimumStreamingPreviewSampleCount, totalCount > lastStreamingPreviewSampleCount else { return }
 
         // No speech gate here: it measured RMS across the whole prefix, so a
         // pause before speaking or a quiet microphone suppressed every preview
@@ -468,7 +645,7 @@ final class DictationCoordinator {
         } catch is CancellationError {
             // Expected when recording stops while a preview pass is in flight.
         } catch {
-            logger.warning("Streaming preview failed: \(error.localizedDescription)")
+            logger.warning("Streaming preview failed: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -512,12 +689,13 @@ final class DictationCoordinator {
             // currentTargetProcessID (and may start a new session), so reading it
             // later would risk typing stale text into the wrong target.
             let targetProcessID = currentTargetProcessID
+            let dictatedApp = targetProcessID.flatMap(dictatedAppResolver)
 
             let modelID = await transcriptionService.currentModelId() ?? TypedSettings[.selectedModel]
             let language = TypedSettings[.selectedLanguage]
 
             let refinementStartedAt = ContinuousClock.now
-            let postProcessingOutcome = try await applyPostProcessing(to: text)
+            let postProcessingOutcome = try await applyPostProcessing(to: text, appName: dictatedApp?.name)
             let refinementFinishedAt = ContinuousClock.now
 
             // Re-validate before saving/typing: the awaits above
@@ -553,7 +731,8 @@ final class DictationCoordinator {
                 language: language,
                 rawTranscript: resolvedOutcome.rawTranscript,
                 wasPostProcessed: resolvedOutcome.wasPostProcessed,
-                postProcessingErrorDescription: resolvedOutcome.errorDescription
+                postProcessingErrorDescription: resolvedOutcome.errorDescription,
+                app: dictatedApp
             ))
             let historyFinishedAt = ContinuousClock.now
 
@@ -564,9 +743,14 @@ final class DictationCoordinator {
                 throw CancellationError()
             }
 
+            if isRetryingFailedDictation {
+                failedDictationSamples = nil
+            }
+
             let trimmedText = resolvedOutcome.outputText.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmedText.isEmpty {
                 typingService.output(trimmedText, targetProcessID: targetProcessID)
+                lastTranscript = trimmedText
             } else if resolvedOutcome.wasPostProcessed {
                 // Post-processor returned empty on success (e.g. "scratch that",
                 // "cancel", "never mind"). This is a valid cancellation: type
@@ -591,8 +775,11 @@ final class DictationCoordinator {
         } catch is CancellationError {
             // Expected when cancel() is called.
         } catch {
-            logger.error("Transcription failed: \(error.localizedDescription)")
+            logger.error("Transcription failed: \(error.localizedDescription, privacy: .public)")
             guard currentSessionID == sessionID else { return }
+            // Shares the buffer rather than copying it. Kept before reporting
+            // so the error UI can rely on the retry being available.
+            failedDictationSamples = samples
             onTranscriptionError?(error)
         }
     }
@@ -651,7 +838,7 @@ final class DictationCoordinator {
     ///   a non-disruptive `onPostProcessingFallback` (no alert).
     /// Cancellation is rethrown so the surrounding task unwinds without saving
     /// history or typing output.
-    private func applyPostProcessing(to rawText: String) async throws -> PostProcessingOutcome {
+    private func applyPostProcessing(to rawText: String, appName: String?) async throws -> PostProcessingOutcome {
         let rawTrimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard isPostProcessingEnabled(),
@@ -686,7 +873,7 @@ final class DictationCoordinator {
 
         do {
             try Task.checkCancellation()
-            let processed = try await provider.process(rawText)
+            let processed = try await provider.process(rawText, appName: appName)
             // A post-processed empty/whitespace result is a VALID outcome, not a
             // failure: the model may produce it by honoring a full self-correction
             // ("scratch that", "cancel", "never mind"). Normalize whitespace-only
@@ -706,10 +893,11 @@ final class DictationCoordinator {
             // dictated is rejected. Give Apple Intelligence one more chance —
             // it sometimes gets it right on a second pass — then fall back.
             if let firstError = PostProcessingValidator.suspiciousPostProcessingError(raw: rawTrimmed, processed: normalized) {
-                logger.notice("Post-processing rejected on first pass, retrying once: \(firstError.description)")
+                logger.notice("Post-processing rejected on first pass, retrying once: \(firstError.description, privacy: .public)")
                 return try await retryPostProcessing(
                     rawText: rawText,
                     rawTrimmed: rawTrimmed,
+                    appName: appName,
                     provider: provider
                 )
             }
@@ -727,7 +915,7 @@ final class DictationCoordinator {
             // True provider failure on the first (and only) attempt: do NOT
             // retry (retries are for guardrail rejection only). Fall back to
             // the raw transcript and surface the error for a disruptive notice.
-            logger.error("Post-processing failed, falling back to raw transcript: \(error.localizedDescription)")
+            logger.error("Post-processing failed, falling back to raw transcript: \(error.localizedDescription, privacy: .public)")
             onPostProcessingError?(error)
             return PostProcessingOutcome(
                 finalText: rawText,
@@ -750,11 +938,12 @@ final class DictationCoordinator {
     private func retryPostProcessing(
         rawText: String,
         rawTrimmed: String,
+        appName: String?,
         provider: any PostProcessingProvider
     ) async throws -> PostProcessingOutcome {
         do {
             try Task.checkCancellation()
-            let processed = try await provider.process(rawText)
+            let processed = try await provider.process(rawText, appName: appName)
             let normalized = processed.trimmingCharacters(in: .whitespacesAndNewlines)
             // An empty retry is ambiguous (the first pass was non-empty-but-
             // bad), so treat it as another validation failure and fall back.
@@ -775,7 +964,7 @@ final class DictationCoordinator {
                     kind: .suspiciousShrinkage,
                     detail: "retry returned an empty result after a rejected first pass"
                 )
-            logger.notice("Post-processing retry also rejected, using raw transcript: \(retryError.description)")
+            logger.notice("Post-processing retry also rejected, using raw transcript: \(retryError.description, privacy: .public)")
             onPostProcessingFallback?()
             return PostProcessingOutcome(
                 finalText: rawText,
@@ -790,7 +979,7 @@ final class DictationCoordinator {
             // The retry threw. We were already in a guardrail-fallback scenario
             // (that is why we retried), so keep the feedback non-disruptive and
             // fall back to the raw transcript. The thrown error is logged.
-            logger.error("Post-processing retry threw, using raw transcript: \(error.localizedDescription)")
+            logger.error("Post-processing retry threw, using raw transcript: \(error.localizedDescription, privacy: .public)")
             onPostProcessingFallback?()
             return PostProcessingOutcome(
                 finalText: rawText,
@@ -807,14 +996,34 @@ final class DictationCoordinator {
     // Validation logic extracted to PostProcessingValidator for testability.
     // See PostProcessingValidator.swift for shrinkage/markdown guardrail rules.
 
+    private func updateIdleSleepActivity() {
+        switch (state, idleSleepActivity) {
+        case (.idle, let activity?):
+            ProcessInfo.processInfo.endActivity(activity)
+            idleSleepActivity = nil
+        case (.recording, nil), (.transcribing, nil):
+            idleSleepActivity = ProcessInfo.processInfo.beginActivity(
+                options: .idleSystemSleepDisabled,
+                reason: "Dictation in progress"
+            )
+        default:
+            break
+        }
+    }
+
     private func finish(sessionID: UUID) {
         guard currentSessionID == sessionID else { return }
         currentSessionID = nil
         currentTargetProcessID = nil
         transcriptionTask = nil
+        let shouldResumeMedia = !isRetryingFailedDictation
+        isRetryingFailedDictation = false
+        isProvisional = false
         state = .idle
         onStateChange?(.idle)
-        mediaPlaybackService.resumeAfterDictationIfNeeded()
+        if shouldResumeMedia {
+            mediaPlaybackService.resumeAfterDictationIfNeeded()
+        }
     }
 }
 

@@ -32,7 +32,6 @@ struct AudioSpeechAssessment: Equatable {
 enum AudioSpeechDetector {
     private static let sampleRate = 16_000.0
     private static let minDuration = 0.25
-    private static let minOverallRMS: Float = 0.003
     private static let minPeak: Float = 0.015
     private static let frameSize = 320
     private static let activeFrameRMSThreshold: Float = 0.006
@@ -59,7 +58,9 @@ enum AudioSpeechDetector {
 
         for sample in samples {
             let absSample = abs(sample)
-            if absSample > peak { peak = absSample }
+            if absSample > peak {
+                peak = absSample
+            }
             let squared = sample * sample
             sumOfSquares += squared
             frameSumOfSquares += squared
@@ -93,8 +94,11 @@ enum AudioSpeechDetector {
             )
         }
 
-        guard rms >= minOverallRMS,
-              peak >= minPeak,
+        // No whole-clip RMS floor: averaging over the clip rejected long
+        // hands-free recordings that were mostly silence around a few seconds
+        // of quiet speech. The peak and active-frame checks judge the speech
+        // itself, however long the clip runs.
+        guard peak >= minPeak,
               activeDuration >= minActiveDuration else {
             return AudioSpeechAssessment(
                 duration: duration,

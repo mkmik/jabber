@@ -155,9 +155,7 @@ final class MediaPlaybackService: MediaPlaybackProtocol {
         logger.notice("Paused media playback for dictation")
         didPauseMediaForThisSession = true
 
-        guard await waitBeforeVerifyingPause() else { return }
-        guard currentSessionID == sessionID, !Task.isCancelled else { return }
-        guard await client.isPlaying() else { return }
+        guard await waitBeforeVerifyingPause(), currentSessionID == sessionID, !Task.isCancelled, await client.isPlaying() else { return }
 
         logger.warning("MediaRemote pause command returned success, but media is still playing; sending system media key fallback")
         pauseWithSystemMediaKeyIfStillPlaying(sessionID: sessionID)
@@ -180,7 +178,7 @@ final class MediaPlaybackService: MediaPlaybackProtocol {
         } catch is CancellationError {
             return false
         } catch {
-            logger.error("Failed while waiting to verify media pause: \(error.localizedDescription)")
+            logger.error("Failed while waiting to verify media pause: \(error.localizedDescription, privacy: .public)")
             return false
         }
     }
@@ -293,8 +291,7 @@ final class MediaRemoteClient: MediaRemoteControlling {
             return nil
         }
 
-        guard let line = result.outputLines.first else { return nil }
-        guard line != "NIL" else { return nil }
+        guard let line = result.outputLines.first, line != "NIL" else { return nil }
 
         do {
             let trackInfo = try JSONDecoder().decode(TrackInfo.self, from: Data(line.utf8))

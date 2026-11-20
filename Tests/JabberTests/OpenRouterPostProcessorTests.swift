@@ -37,7 +37,7 @@ final class OpenRouterPostProcessorTests: XCTestCase {
             )
         )
 
-        let result = try await provider.process(" um hello ")
+        let result = try await provider.process(" um hello ", appName: nil)
         XCTAssertEqual(result, "Hello.")
         XCTAssertEqual(captured.requests.count, 1)
     }
@@ -51,7 +51,7 @@ final class OpenRouterPostProcessorTests: XCTestCase {
                 body: #"{"choices":[{"message":{"content":""}}]}"#
             )
         )
-        let result = try await provider.process("cancel that")
+        let result = try await provider.process("cancel that", appName: nil)
         XCTAssertEqual(result, "")
     }
 
@@ -67,7 +67,7 @@ final class OpenRouterPostProcessorTests: XCTestCase {
             )
         )
 
-        _ = try await provider.process("señor chang")
+        _ = try await provider.process("señor chang", appName: nil)
 
         let request = try XCTUnwrap(captured.requests.first)
         XCTAssertEqual(request.httpMethod, "POST")
@@ -83,13 +83,17 @@ final class OpenRouterPostProcessorTests: XCTestCase {
         XCTAssertEqual(json["model"] as? String, "~anthropic/claude-haiku-latest")
         XCTAssertEqual(json["stream"] as? Bool, false)
         XCTAssertEqual(json["temperature"] as? Int, 0)
+        XCTAssertEqual((json["reasoning"] as? [String: Any])?["effort"] as? String, "none")
+        let routing = try XCTUnwrap(json["provider"] as? [String: Any])
+        XCTAssertEqual(routing["sort"] as? String, "latency")
+        XCTAssertEqual(routing["zdr"] as? Bool, true, "transcripts must only reach zero-retention providers")
 
         let messages = try XCTUnwrap(json["messages"] as? [[String: Any]])
         XCTAssertEqual(messages.count, 2)
         XCTAssertEqual(messages[0]["role"] as? String, "system")
         XCTAssertEqual(messages[0]["content"] as? String, AppleIntelligencePostProcessor.instructions)
         XCTAssertEqual(messages[1]["role"] as? String, "user")
-        XCTAssertEqual(messages[1]["content"] as? String, "señor chang")
+        XCTAssertEqual(messages[1]["content"] as? String, "<transcript>\nseñor chang\n</transcript>")
     }
 
     func testProcessUnknownModelSlugFallsBackToDefault() async throws {
@@ -102,7 +106,7 @@ final class OpenRouterPostProcessorTests: XCTestCase {
             )
         )
 
-        _ = try await provider.process("abed")
+        _ = try await provider.process("abed", appName: nil)
         let body = try XCTUnwrap(captured.requests.first?.httpBody)
         let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: body) as? [String: Any])
         XCTAssertEqual(json["model"] as? String, OpenRouterModelCatalog.defaultModelId)
@@ -116,7 +120,7 @@ final class OpenRouterPostProcessorTests: XCTestCase {
             transport: RequestCapture().transportReturning(body: "{}")
         )
         do {
-            _ = try await provider.process("hello")
+            _ = try await provider.process("hello", appName: nil)
             XCTFail("Expected missingApiKey")
         } catch let error as OpenRouterPostProcessingError {
             XCTAssertEqual(error, .missingApiKey)
@@ -133,7 +137,7 @@ final class OpenRouterPostProcessorTests: XCTestCase {
             transport: RequestCapture().transportReturning(body: #"{"error":"rate limited"}"#, status: 429)
         )
         do {
-            _ = try await provider.process("hello")
+            _ = try await provider.process("hello", appName: nil)
             XCTFail("Expected httpFailure")
         } catch let error as OpenRouterPostProcessingError {
             XCTAssertEqual(error, .httpFailure(429, nil))
@@ -152,7 +156,7 @@ final class OpenRouterPostProcessorTests: XCTestCase {
             transport: RequestCapture().transportReturning(body: body, status: 402)
         )
         do {
-            _ = try await provider.process("hello")
+            _ = try await provider.process("hello", appName: nil)
             XCTFail("Expected httpFailure")
         } catch let error as OpenRouterPostProcessingError {
             XCTAssertEqual(error, .httpFailure(402, "No more credits, Troy."))
@@ -172,7 +176,7 @@ final class OpenRouterPostProcessorTests: XCTestCase {
             transport: RequestCapture().transportReturning(body: body, status: 500)
         )
         do {
-            _ = try await provider.process("hello")
+            _ = try await provider.process("hello", appName: nil)
             XCTFail("Expected httpFailure")
         } catch let error as OpenRouterPostProcessingError {
             let message = extractHttpFailureMessage(error)
@@ -189,7 +193,7 @@ final class OpenRouterPostProcessorTests: XCTestCase {
             transport: RequestCapture().transportReturning(body: "not json at all")
         )
         do {
-            _ = try await provider.process("hello")
+            _ = try await provider.process("hello", appName: nil)
             XCTFail("Expected malformedResponse")
         } catch let error as OpenRouterPostProcessingError {
             XCTAssertEqual(error, .malformedResponse)
@@ -204,7 +208,7 @@ final class OpenRouterPostProcessorTests: XCTestCase {
             transport: RequestCapture().transportReturning(body: #"{"choices":[]}"#)
         )
         do {
-            _ = try await provider.process("hello")
+            _ = try await provider.process("hello", appName: nil)
             XCTFail("Expected emptyResponse")
         } catch let error as OpenRouterPostProcessingError {
             XCTAssertEqual(error, .emptyResponse)
@@ -219,7 +223,7 @@ final class OpenRouterPostProcessorTests: XCTestCase {
             transport: RequestCapture().transportReturning(body: #"{"choices":[{"message":{}}]}"#)
         )
         do {
-            _ = try await provider.process("hello")
+            _ = try await provider.process("hello", appName: nil)
             XCTFail("Expected malformedResponse")
         } catch let error as OpenRouterPostProcessingError {
             XCTAssertEqual(error, .malformedResponse)
@@ -235,7 +239,7 @@ final class OpenRouterPostProcessorTests: XCTestCase {
             transport: RequestCapture().transportThrowing(GreendaleNetworkError())
         )
         do {
-            _ = try await provider.process("hello")
+            _ = try await provider.process("hello", appName: nil)
             XCTFail("Expected networkError")
         } catch let error as OpenRouterPostProcessingError {
             if case .networkError = error {
@@ -257,7 +261,7 @@ final class OpenRouterPostProcessorTests: XCTestCase {
             transport: RequestCapture().transportThrowing(URLError(.cancelled))
         )
         do {
-            _ = try await provider.process("hello")
+            _ = try await provider.process("hello", appName: nil)
             XCTFail("Expected CancellationError")
         } catch is CancellationError {
             // expected
@@ -304,7 +308,7 @@ final class OpenCodeZenPostProcessorTests: XCTestCase {
             )
         )
 
-        let result = try await provider.process("um hello from greendale")
+        let result = try await provider.process("um hello from greendale", appName: nil)
         XCTAssertEqual(result, "Hello from Greendale.")
 
         let request = try XCTUnwrap(captured.requests.first)
@@ -321,13 +325,16 @@ final class OpenCodeZenPostProcessorTests: XCTestCase {
         XCTAssertEqual(json["model"] as? String, "minimax-m3")
         XCTAssertEqual(json["stream"] as? Bool, false)
         XCTAssertEqual(json["temperature"] as? Int, 0)
+        XCTAssertNil(json["reasoning_effort"], "MiniMax M3 has no documented effort field on Zen")
+        XCTAssertNil(json["reasoning"], "the reasoning object is OpenRouter's, not Zen's")
+        XCTAssertNil(json["provider"], "provider routing is OpenRouter's, not Zen's")
 
         let messages = try XCTUnwrap(json["messages"] as? [[String: Any]])
         XCTAssertEqual(messages.count, 2)
         XCTAssertEqual(messages[0]["role"] as? String, "system")
         XCTAssertEqual(messages[0]["content"] as? String, AppleIntelligencePostProcessor.instructions)
         XCTAssertEqual(messages[1]["role"] as? String, "user")
-        XCTAssertEqual(messages[1]["content"] as? String, "um hello from greendale")
+        XCTAssertEqual(messages[1]["content"] as? String, "<transcript>\num hello from greendale\n</transcript>")
     }
 
     func testUnknownModelFallsBackToDefault() async throws {
@@ -340,11 +347,28 @@ final class OpenCodeZenPostProcessorTests: XCTestCase {
             )
         )
 
-        _ = try await provider.process("cool cool cool")
+        _ = try await provider.process("cool cool cool", appName: nil)
 
         let body = try XCTUnwrap(captured.requests.first?.httpBody)
         let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: body) as? [String: Any])
         XCTAssertEqual(json["model"] as? String, OpenCodeZenModelCatalog.defaultModelId)
+    }
+
+    func testSendsTheModelsReasoningEffort() async throws {
+        let captured = RequestCapture()
+        let provider = OpenCodeZenPostProcessor(
+            apiKey: testKey,
+            modelId: "mistral-large-4",
+            transport: captured.transportReturning(
+                body: #"{"choices":[{"message":{"content":"ok"}}]}"#
+            )
+        )
+
+        _ = try await provider.process("six seasons and a movie", appName: nil)
+
+        let body = try XCTUnwrap(captured.requests.first?.httpBody)
+        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertEqual(json["reasoning_effort"] as? String, "none")
     }
 
     func testMissingKeyUsesZenSpecificError() async {
@@ -354,7 +378,7 @@ final class OpenCodeZenPostProcessorTests: XCTestCase {
         )
 
         do {
-            _ = try await provider.process("hello")
+            _ = try await provider.process("hello", appName: nil)
             XCTFail("Expected missingApiKey")
         } catch let error as OpenCodeZenPostProcessingError {
             XCTAssertEqual(error, .missingApiKey)
@@ -374,7 +398,7 @@ final class OpenCodeZenPostProcessorTests: XCTestCase {
         )
 
         do {
-            _ = try await provider.process("hello")
+            _ = try await provider.process("hello", appName: nil)
             XCTFail("Expected httpFailure")
         } catch let error as OpenCodeZenPostProcessingError {
             XCTAssertEqual(error, .httpFailure(402, "No more credits, Troy."))

@@ -72,8 +72,7 @@ enum PostProcessingValidator {
     }
 
     static func rogueMarkdownError(raw: String, processed: String) -> PostProcessingValidationError? {
-        guard beginsWithMarkdownStructure(processed) else { return nil }
-        guard !containsFormattingCommand(raw) else { return nil }
+        guard beginsWithMarkdownStructure(processed), !containsFormattingCommand(raw) else { return nil }
         return PostProcessingValidationError(
             kind: .rogueMarkdown,
             detail: "output introduces markdown formatting that was not dictated"
@@ -117,7 +116,9 @@ enum PostProcessingValidator {
         let trimmed = String(firstLine).trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return false }
 
-        if trimmed.hasPrefix("#") { return true } // ATX heading
+        if trimmed.hasPrefix("#") {
+            return true
+        } // ATX heading
         if trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") || trimmed.hasPrefix("+ ") {
             return true // bullet list
         }

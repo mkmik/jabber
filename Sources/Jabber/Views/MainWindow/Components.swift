@@ -8,7 +8,7 @@ struct LanguagePicker: View {
 
     var body: some View {
         Picker("Language", selection: $selectedLanguage) {
-            Text("Auto-detect").tag("auto")
+            Text("Automatic").tag("auto")
             Divider()
             ForEach(Constants.sortedLanguages, id: \.code) { lang in
                 Text(lang.name).tag(lang.code)
@@ -38,9 +38,38 @@ struct KeycapsView: View {
     }
 }
 
+/// Warns that pressing Fn (🌐) also triggers a macOS action, with a way to
+/// the setting that turns it off.
+struct GlobeKeyWarning: View {
+    let message: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Label {
+                Text(message)
+                    .fixedSize(horizontal: false, vertical: true)
+            } icon: {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+            }
+            .font(.callout)
+
+            Spacer(minLength: 0)
+
+            Button("Open Keyboard Settings") {
+                GlobeKeyAction.openKeyboardSettings()
+            }
+        }
+    }
+}
+
 struct ModelRow: View {
     let model: ModelManager.Model
     let isSelected: Bool
+    /// The catalog's pick for the selected language.
+    let isRecommended: Bool
+    /// Name of the selected language when this model can't transcribe it.
+    let unsupportedLanguageName: String?
     let onSelect: () -> Void
     let onDownload: () -> Void
     let onDelete: () -> Void
@@ -56,11 +85,26 @@ struct ModelRow: View {
                     Text(model.sizeHint)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+
+                    if isRecommended {
+                        Text("Recommended")
+                            .font(.caption2.weight(.medium))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(Color.accentColor.opacity(0.15), in: Capsule())
+                            .foregroundStyle(Color.accentColor)
+                    }
                 }
 
                 Text(model.description)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                if let unsupportedLanguageName {
+                    Text("Doesn't support \(unsupportedLanguageName)")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
             }
 
             Spacer()
@@ -106,7 +150,10 @@ struct ModelRow: View {
             selectButton
         }
 
-        deleteButton
+        // Built-in models ship with macOS; there is nothing to delete.
+        if AppMode.modelDefinition(for: model.id)?.isBuiltIn != true {
+            deleteButton
+        }
     }
 
     private var selectButton: some View {
@@ -128,56 +175,9 @@ struct ModelRow: View {
     }
 
     private var downloadButton: some View {
-        Button("Download") {
+        Button("Download & Use") {
             onDownload()
         }
         .buttonStyle(.bordered)
-    }
-}
-
-struct HistoryEntryRow: View {
-    let entry: DictationHistoryEntry
-    let onReveal: () -> Void
-
-    var body: some View {
-        HStack(alignment: .top) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(entry.timestamp.formatted(date: .abbreviated, time: .shortened))
-                    .fontWeight(.semibold)
-
-                Text(entry.transcript.isEmpty ? "No transcript text" : entry.transcript)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-
-                Text("\(entry.modelName) • \(entry.languageDisplayName) • \(entry.durationDisplayText) • \(entry.audioSizeDisplayText)")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
-
-            Spacer()
-
-            Button("Reveal") {
-                onReveal()
-            }
-            .buttonStyle(.borderless)
-        }
-    }
-}
-
-private extension DictationHistoryEntry {
-    var durationDisplayText: String {
-        String(format: "%.1fs", duration)
-    }
-
-    var audioSizeDisplayText: String {
-        ByteCountFormatter.string(fromByteCount: audioByteCount, countStyle: .file)
-    }
-
-    var languageDisplayName: String {
-        if language == "auto" {
-            return "Auto"
-        }
-        return Constants.sortedLanguages.first { $0.code == language }?.name ?? language
     }
 }
